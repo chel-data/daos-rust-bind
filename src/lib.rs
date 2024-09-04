@@ -18,6 +18,7 @@
 pub mod bindings;
 pub mod daos;
 pub mod daos_obj_ops;
+mod async_utils;
 
 pub fn add(left: usize, right: usize) -> usize {
     left + right

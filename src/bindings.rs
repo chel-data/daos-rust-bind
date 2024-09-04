@@ -28,6 +28,9 @@ pub fn daos_anchor_is_eof(anchor: &daos_anchor_t) -> bool
     daos_anchor_type_t_DAOS_ANCHOR_TYPE_EOF == anchor.da_type.into()
 }
 
+unsafe impl Send for d_iov_t {}
+unsafe impl Send for daos_iod_t {}
+unsafe impl Send for d_sg_list_t {}
 
 #[cfg(test)]
 mod tests {
