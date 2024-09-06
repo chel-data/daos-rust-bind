@@ -26,9 +26,9 @@ use std::{
 
 use crate::async_utils::*;
 use crate::bindings::{
-    daos_cont_close, daos_cont_open2, daos_eq_create, daos_eq_destroy, daos_event_t, daos_handle_t,
-    daos_init, daos_obj_close, daos_obj_id_t, daos_pool_connect2, daos_pool_disconnect,
-    daos_tx_abort, daos_tx_close, daos_tx_commit, daos_tx_open, DAOS_COO_RW, DAOS_PC_RW,
+    daos_cont_close, daos_cont_open2, daos_event_t, daos_handle_t, daos_init, daos_obj_close,
+    daos_obj_id_t, daos_pool_connect2, daos_pool_disconnect, daos_tx_abort, daos_tx_close,
+    daos_tx_commit, daos_tx_open, DAOS_COO_RW, DAOS_PC_RW,
 };
 
 static INIT_DAOS: Once = Once::new();
@@ -118,7 +118,7 @@ pub struct DaosContainer<'a> {
     pub label: String,
     pool: &'a DaosPool,
     handle: Option<daos_handle_t>,
-    event_queue: Option<daos_handle_t>,
+    event_queue: Option<DaosEventQueue>,
 }
 
 impl<'a> DaosContainer<'a> {
@@ -135,8 +135,8 @@ impl<'a> DaosContainer<'a> {
         self.handle.unwrap()
     }
 
-    pub fn get_event_queue(&self) -> daos_handle_t {
-        self.event_queue.unwrap()
+    pub fn get_event_queue(&self) -> Option<&DaosEventQueue> {
+        self.event_queue.as_ref()
     }
 
     // Should not be called in async executer like tokio.
@@ -164,7 +164,7 @@ impl<'a> DaosContainer<'a> {
         };
         if res == 0 {
             self.handle.replace(coh);
-            self.create_event_queue()
+            self.create_eq()
         } else {
             Err(Error::new(
                 ErrorKind::Other,
@@ -180,55 +180,30 @@ impl<'a> DaosContainer<'a> {
             let res = unsafe { daos_cont_close(self.handle.unwrap(), ptr::null_mut()) };
             if res == 0 {
                 self.handle.take();
+                Ok(())
+            } else {
+                Err(Error::new(
+                    ErrorKind::Other,
+                    "Failed to close DAOS container",
+                ))
             }
-        }
-
-        if self.event_queue.is_some() {
-            self.destroy_event_queu()?;
-        }
-
-        if self.handle.is_some() || self.event_queue.is_some() {
-            Err(Error::new(
-                ErrorKind::Other,
-                "Failed to close DAOS container",
-            ))
         } else {
             Ok(())
         }
     }
 
-    fn create_event_queue(&mut self) -> Result<()> {
+    fn create_eq(&mut self) -> Result<()> {
         if self.event_queue.is_some() {
             return Ok(());
         }
 
-        let mut eqh: daos_handle_t = daos_handle_t { cookie: 0u64 };
-        let res = unsafe { daos_eq_create(&mut eqh) };
-        if res == 0 {
-            self.event_queue.replace(eqh);
-            Ok(())
-        } else {
-            Err(Error::new(
-                ErrorKind::Other,
-                "Failed to create DAOS event queue",
-            ))
-        }
-    }
-
-    fn destroy_event_queu(&mut self) -> Result<()> {
-        if self.event_queue.is_none() {
-            return Ok(());
-        }
-
-        let res = unsafe { daos_eq_destroy(self.event_queue.unwrap(), 0) };
-        if res == 0 {
-            self.event_queue.take();
-            Ok(())
-        } else {
-            Err(Error::new(
-                ErrorKind::Other,
-                "Failed to destroy DAOS event queue",
-            ))
+        let res = DaosEventQueue::new();
+        match res {
+            Ok(eqh) => {
+                self.event_queue.replace(eqh);
+                Ok(())
+            }
+            Err(e) => Err(e),
         }
     }
 }
@@ -252,7 +227,11 @@ pub struct DaosObject {
 }
 
 impl DaosObject {
-    pub fn new(id: daos_obj_id_t, hdl: daos_handle_t, evt_que: Option<daos_handle_t>) -> Self {
+    pub(crate) fn new(
+        id: daos_obj_id_t,
+        hdl: daos_handle_t,
+        evt_que: Option<daos_handle_t>,
+    ) -> Self {
         DaosObject {
             oid: id,
             handle: Some(hdl),
@@ -336,13 +315,23 @@ impl DaosTxnAsyncOps for DaosTxn {
     ) -> impl Future<Output = Result<Box<DaosTxn>>> + Send + 'static {
         let cont_hdl = cont.get_handle();
         let eq = cont.get_event_queue();
+        let eqh = eq.map(|e| e.get_handle());
+        let evt = eq.map(|e| e.create_event());
         async move {
-            let res = create_async_event(eq);
+            if evt.is_none() {
+                return Err(Error::new(ErrorKind::InvalidInput, "empty event queue"));
+            }
+            let res = evt.unwrap();
             if res.is_err() {
                 return Err(res.unwrap_err());
             }
+            let mut event = res.unwrap();
 
-            let (mut event, _call_arg, rx) = res.unwrap();
+            let res = event.register_callback();
+            if res.is_err() {
+                return Err(res.unwrap_err());
+            }
+            let rx = res.unwrap();
 
             let mut tx_hdl = daos_handle_t { cookie: 0u64 };
             let res = unsafe {
@@ -370,7 +359,7 @@ impl DaosTxnAsyncOps for DaosTxn {
                     } else {
                         Ok(Box::new(DaosTxn {
                             handle: Some(tx_hdl),
-                            event_que: Some(eq),
+                            event_que: eqh,
                         }))
                     }
                 }
@@ -384,18 +373,23 @@ impl DaosTxnAsyncOps for DaosTxn {
 
     fn commit_async(&self) -> impl Future<Output = Result<()>> + Send + 'static {
         let txn_hdl = self.handle.clone();
-        let eq = self.event_que.clone();
+        let eq: Option<_> = self.event_que.clone();
         async move {
             if txn_hdl.is_none() || eq.is_none() {
                 return Err(Error::new(ErrorKind::InvalidData, "commit empty txn"));
             }
 
-            let res = create_async_event(eq.unwrap());
+            let res = DaosEvent::new(eq.unwrap());
             if res.is_err() {
                 return Err(res.unwrap_err());
             }
+            let mut event = res.unwrap();
 
-            let (mut event, _call_arg, rx) = res.unwrap();
+            let res = event.register_callback();
+            if res.is_err() {
+                return Err(res.unwrap_err());
+            }
+            let rx = res.unwrap();
 
             let res = unsafe { daos_tx_commit(txn_hdl.unwrap(), event.as_mut()) };
             if res != 0 {
@@ -429,12 +423,17 @@ impl DaosTxnAsyncOps for DaosTxn {
                 return Err(Error::new(ErrorKind::InvalidData, "abort empty txn"));
             }
 
-            let res = create_async_event(eq.unwrap());
+            let res = DaosEvent::new(eq.unwrap());
             if res.is_err() {
                 return Err(res.unwrap_err());
             }
+            let mut event = res.unwrap();
 
-            let (mut event, _call_arg, rx) = res.unwrap();
+            let res = event.register_callback();
+            if res.is_err() {
+                return Err(res.unwrap_err());
+            }
+            let rx = res.unwrap();
 
             let res = unsafe { daos_tx_abort(tx_hdl.unwrap(), event.as_mut()) };
             if res != 0 {
@@ -468,12 +467,17 @@ impl DaosTxnAsyncOps for DaosTxn {
                 return Err(Error::new(ErrorKind::InvalidData, "close empty txn"));
             }
 
-            let res = create_async_event(eq.unwrap());
+            let res = DaosEvent::new(eq.unwrap());
             if res.is_err() {
                 return Err(res.unwrap_err());
             }
+            let mut event = res.unwrap();
 
-            let (mut event, _call_arg, rx) = res.unwrap();
+            let res = event.register_callback();
+            if res.is_err() {
+                return Err(res.unwrap_err());
+            }
+            let rx = res.unwrap();
 
             let res = unsafe { daos_tx_close(tx_hdl.unwrap(), event.as_mut()) };
             if res != 0 {
@@ -560,7 +564,7 @@ mod tests {
 
     #[test]
     fn test_daos_container_disconnect() {
-        let mut pool = DaosPool::new(TEST_POOL_NAME);
+        let pool = DaosPool::new(TEST_POOL_NAME);
         let mut container = DaosContainer::new(TEST_CONT_NAME, &pool);
         assert_eq!(container.handle.is_some(), false);
 
