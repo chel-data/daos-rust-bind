@@ -3,6 +3,11 @@ name = "daos-rust-api"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "daos_rust_api"
+path = "src/lib.rs"
+crate-type = ["dylib"]
+
 [dependencies]
 tokio = { version = "1.39.3", features = ["macros", "rt", "rt-multi-thread", "sync"] }
 
