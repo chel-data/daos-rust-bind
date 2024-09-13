@@ -27,18 +27,17 @@ use crate::bindings::{
     DAOS_OO_RO, DAOS_OO_RW, DAOS_REC_ANY, DAOS_TXN_NONE,
 };
 use crate::daos::{DaosContainer, DaosObject, DaosTxn};
-use std::task::{Context, Poll};
 
 pub trait DaosObjSyncOps {
     fn create(
-        cont: &DaosContainer<'_>,
+        cont: &DaosContainer,
         otype: daos_otype_t,
         cid: daos_oclass_id_t,
         hints: daos_oclass_hints_t,
         args: u32,
     ) -> Result<Box<DaosObject>>;
     fn open(
-        cont: &DaosContainer<'_>,
+        cont: &DaosContainer,
         oid: daos_obj_id_t,
         read_only: bool,
     ) -> Result<Box<DaosObject>>;
@@ -55,14 +54,14 @@ pub trait DaosObjSyncOps {
 
 pub trait DaosObjAsyncOps {
     fn create_async(
-        cont: &DaosContainer<'_>,
+        cont: &DaosContainer,
         otype: daos_otype_t,
         cid: daos_oclass_id_t,
         hints: daos_oclass_hints_t,
         args: u32,
     ) -> impl Future<Output = Result<Box<DaosObject>>> + Send + 'static;
     fn open_async(
-        cont: &DaosContainer<'_>,
+        cont: &DaosContainer,
         oid: daos_obj_id_t,
         read_only: bool,
     ) -> impl Future<Output = Result<Box<DaosObject>>> + Send + 'static;
@@ -87,7 +86,7 @@ pub trait DaosObjAsyncOps {
 
 impl DaosObjSyncOps for DaosObject {
     fn create(
-        cont: &DaosContainer<'_>,
+        cont: &DaosContainer,
         otype: daos_otype_t,
         cid: daos_oclass_id_t,
         hints: daos_oclass_hints_t,
@@ -115,7 +114,7 @@ impl DaosObjSyncOps for DaosObject {
     }
 
     fn open(
-        cont: &DaosContainer<'_>,
+        cont: &DaosContainer,
         oid: daos_obj_id_t,
         read_only: bool,
     ) -> Result<Box<DaosObject>> {
@@ -198,7 +197,7 @@ impl DaosObjSyncOps for DaosObject {
 
 impl DaosObjAsyncOps for DaosObject {
     fn create_async(
-        cont: &DaosContainer<'_>,
+        cont: &DaosContainer,
         otype: daos_otype_t,
         cid: daos_oclass_id_t,
         hints: daos_oclass_hints_t,
@@ -263,7 +262,7 @@ impl DaosObjAsyncOps for DaosObject {
     }
 
     fn open_async(
-        cont: &DaosContainer<'_>,
+        cont: &DaosContainer,
         oid: daos_obj_id_t,
         read_only: bool,
     ) -> impl Future<Output = Result<Box<DaosObject>>> + Send + 'static {
@@ -576,8 +575,8 @@ mod tests {
         let mut pool = DaosPool::new(TEST_POOL_NAME);
         pool.connect().expect("Failed to connect to pool");
 
-        let mut cont = DaosContainer::new(TEST_CONT_NAME, &pool);
-        cont.connect().expect("Failed to connect to container");
+        let mut cont = DaosContainer::new(TEST_CONT_NAME);
+        cont.connect(&pool).expect("Failed to connect to container");
 
         let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
         let cid: daos_oclass_id_t = OC_UNKNOWN;
@@ -596,8 +595,8 @@ mod tests {
         let mut pool = DaosPool::new(TEST_POOL_NAME);
         pool.connect().expect("Failed to connect to pool");
 
-        let mut cont = DaosContainer::new(TEST_CONT_NAME, &pool);
-        cont.connect().expect("Failed to connect to container");
+        let mut cont = DaosContainer::new(TEST_CONT_NAME);
+        cont.connect(&pool).expect("Failed to connect to container");
 
         let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
         let cid: daos_oclass_id_t = OC_UNKNOWN;
@@ -629,8 +628,8 @@ mod tests {
                 let mut pool = DaosPool::new(TEST_POOL_NAME);
                 pool.connect().expect("Failed to connect to pool");
 
-                let mut cont = DaosContainer::new(TEST_CONT_NAME, &pool);
-                cont.connect().expect("Failed to connect to container");
+                let mut cont = DaosContainer::new(TEST_CONT_NAME);
+                cont.connect(&pool).expect("Failed to connect to container");
 
                 let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
                 let cid: daos_oclass_id_t = OC_UNKNOWN;
@@ -655,8 +654,8 @@ mod tests {
                 let mut pool = DaosPool::new(TEST_POOL_NAME);
                 pool.connect().expect("Failed to connect to pool");
 
-                let mut cont = DaosContainer::new(TEST_CONT_NAME, &pool);
-                cont.connect().expect("Failed to connect to container");
+                let mut cont = DaosContainer::new(TEST_CONT_NAME);
+                cont.connect(&pool).expect("Failed to connect to container");
 
                 let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
                 let cid: daos_oclass_id_t = OC_UNKNOWN;
@@ -686,8 +685,8 @@ mod tests {
                 let mut pool = DaosPool::new(TEST_POOL_NAME);
                 pool.connect().expect("Failed to connect to pool");
 
-                let mut cont = DaosContainer::new(TEST_CONT_NAME, &pool);
-                cont.connect().expect("Failed to connect to container");
+                let mut cont = DaosContainer::new(TEST_CONT_NAME);
+                cont.connect(&pool).expect("Failed to connect to container");
 
                 let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
                 let cid: daos_oclass_id_t = OC_UNKNOWN;
@@ -715,8 +714,8 @@ mod tests {
                 let mut pool = DaosPool::new(TEST_POOL_NAME);
                 pool.connect().expect("Failed to connect to pool");
 
-                let mut cont = DaosContainer::new(TEST_CONT_NAME, &pool);
-                cont.connect().expect("Failed to connect to container");
+                let mut cont = DaosContainer::new(TEST_CONT_NAME);
+                cont.connect(&pool).expect("Failed to connect to container");
 
                 let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
                 let cid: daos_oclass_id_t = OC_UNKNOWN;
@@ -749,8 +748,8 @@ mod tests {
                 let mut pool = DaosPool::new(TEST_POOL_NAME);
                 pool.connect().expect("Failed to connect to pool");
 
-                let mut cont = DaosContainer::new(TEST_CONT_NAME, &pool);
-                cont.connect().expect("Failed to connect to container");
+                let mut cont = DaosContainer::new(TEST_CONT_NAME);
+                cont.connect(&pool).expect("Failed to connect to container");
 
                 let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
                 let cid: daos_oclass_id_t = OC_UNKNOWN;

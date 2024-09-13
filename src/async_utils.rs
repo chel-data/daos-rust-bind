@@ -40,7 +40,7 @@ pub struct DaosEvent {
 
 unsafe extern "C" fn event_callback(
     arg1: *mut ::std::os::raw::c_void,
-    arg2: *mut daos_event_t,
+    _arg2: *mut daos_event_t,
     arg3: ::std::os::raw::c_int,
 ) -> i32 {
     let raw_arg = arg1 as *mut CallbackArg;

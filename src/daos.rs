@@ -31,6 +31,9 @@ use crate::bindings::{
     daos_tx_commit, daos_tx_open, DAOS_COO_RW, DAOS_PC_RW,
 };
 
+pub type DaosObjectId = daos_obj_id_t;
+pub type DaosInnerHandle = daos_handle_t;
+
 static INIT_DAOS: Once = Once::new();
 
 #[derive(Debug)]
@@ -114,18 +117,16 @@ impl Drop for DaosPool {
 }
 
 #[derive(Debug)]
-pub struct DaosContainer<'a> {
+pub struct DaosContainer {
     pub label: String,
-    pool: &'a DaosPool,
     handle: Option<daos_handle_t>,
     event_queue: Option<DaosEventQueue>,
 }
 
-impl<'a> DaosContainer<'a> {
-    pub fn new(label: &str, daos_pool: &'a DaosPool) -> Self {
+impl DaosContainer {
+    pub fn new(label: &str) -> Self {
         DaosContainer {
             label: label.to_string(),
-            pool: daos_pool,
             handle: None,
             event_queue: None,
         }
@@ -141,12 +142,12 @@ impl<'a> DaosContainer<'a> {
 
     // Should not be called in async executer like tokio.
     // Consider spawning a new thread to open/close containers.
-    pub fn connect(&mut self) -> Result<()> {
+    pub fn connect(&mut self, daos_pool: & DaosPool) -> Result<()> {
         if self.handle.is_some() {
             return Ok(());
         }
 
-        if self.pool.handle.is_none() {
+        if daos_pool.handle.is_none() {
             return Err(Error::new(ErrorKind::Other, "Pool is not connected"));
         }
 
@@ -154,7 +155,7 @@ impl<'a> DaosContainer<'a> {
         let mut coh: daos_handle_t = daos_handle_t { cookie: 0u64 };
         let res = unsafe {
             daos_cont_open2(
-                self.pool.handle.unwrap(),
+                daos_pool.handle.unwrap(),
                 c_label.as_ptr(),
                 DAOS_COO_RW,
                 &mut coh,
@@ -208,7 +209,7 @@ impl<'a> DaosContainer<'a> {
     }
 }
 
-impl Drop for DaosContainer<'_> {
+impl Drop for DaosContainer {
     fn drop(&mut self) {
         let res = self.disconnect();
         match res {
@@ -220,6 +221,7 @@ impl Drop for DaosContainer<'_> {
     }
 }
 
+#[derive(Debug)]
 pub struct DaosObject {
     pub oid: daos_obj_id_t,
     handle: Option<daos_handle_t>,
@@ -292,7 +294,7 @@ impl DaosTxn {
 }
 
 pub trait DaosTxnSyncOps {
-    fn open(cont: &DaosContainer<'_>, flags: u64) -> Result<Box<DaosTxn>>;
+    fn open(cont: &DaosContainer, flags: u64) -> Result<Box<DaosTxn>>;
     fn commit(&self) -> Result<()>;
     fn abort(&self) -> Result<()>;
     fn close(&self) -> Result<()>;
@@ -300,7 +302,7 @@ pub trait DaosTxnSyncOps {
 
 pub trait DaosTxnAsyncOps {
     fn open_async(
-        cont: &DaosContainer<'_>,
+        cont: &DaosContainer,
         flags: u64,
     ) -> impl Future<Output = Result<Box<DaosTxn>>> + Send + 'static;
     fn commit_async(&self) -> impl Future<Output = Result<()>> + Send + 'static;
@@ -310,7 +312,7 @@ pub trait DaosTxnAsyncOps {
 
 impl DaosTxnAsyncOps for DaosTxn {
     fn open_async(
-        cont: &DaosContainer<'_>,
+        cont: &DaosContainer,
         flags: u64,
     ) -> impl Future<Output = Result<Box<DaosTxn>>> + Send + 'static {
         let cont_hdl = cont.get_handle();
@@ -547,14 +549,14 @@ mod tests {
         let result = pool.connect();
         assert_eq!(result.is_ok(), true);
 
-        let mut container = DaosContainer::new(TEST_CONT_NAME, &pool);
+        let mut container = DaosContainer::new(TEST_CONT_NAME);
         assert_eq!(container.handle.is_some(), false);
 
-        let result = container.connect();
+        let result = container.connect(&pool);
         assert_eq!(result.is_ok(), true);
         assert_eq!(container.handle.is_some(), true);
 
-        let result = container.connect();
+        let result = container.connect(&pool);
         assert_eq!(result.is_ok(), true);
         assert_eq!(container.handle.is_some(), true);
 
@@ -565,7 +567,7 @@ mod tests {
     #[test]
     fn test_daos_container_disconnect() {
         let pool = DaosPool::new(TEST_POOL_NAME);
-        let mut container = DaosContainer::new(TEST_CONT_NAME, &pool);
+        let mut container = DaosContainer::new(TEST_CONT_NAME);
         assert_eq!(container.handle.is_some(), false);
 
         let result = container.disconnect();
