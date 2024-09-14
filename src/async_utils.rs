@@ -166,8 +166,8 @@ impl DaosEventQueue {
         }
     }
 
-    pub fn get_handle(&self) -> daos_handle_t {
-        self.handle.unwrap()
+    pub fn get_handle(&self) -> Option<daos_handle_t> {
+        self.handle.clone()
     }
 
     pub fn create_event(&self) -> Result<DaosEvent> {

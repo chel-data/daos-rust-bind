@@ -94,17 +94,17 @@ impl DaosObjSyncOps for DaosObject {
     ) -> Result<Box<DaosObject>> {
         let cont_hdl = cont.get_handle();
         let eq = cont.get_event_queue();
-        let eqh = eq.map(|eq| eq.get_handle());
+        let eqh = eq.map(|eq| eq.get_handle().unwrap());
 
         let mut oid = daos_obj_id_t { lo: 0, hi: 0 };
-        let ret = unsafe { daos_obj_generate_oid2(cont_hdl, &mut oid, otype, cid, hints, args) };
+        let ret = unsafe { daos_obj_generate_oid2(cont_hdl.unwrap(), &mut oid, otype, cid, hints, args) };
 
         if ret != 0 {
             return Err(Error::new(ErrorKind::Other, "can't generate object id"));
         }
 
         let mut obj_hdl = daos_handle_t { cookie: 0u64 };
-        let ret = unsafe { daos_obj_open(cont_hdl, oid, DAOS_OO_RW, &mut obj_hdl, std::ptr::null_mut()) };
+        let ret = unsafe { daos_obj_open(cont_hdl.unwrap(), oid, DAOS_OO_RW, &mut obj_hdl, std::ptr::null_mut()) };
 
         if ret != 0 {
             return Err(Error::new(ErrorKind::Other, "can't open object"));
@@ -114,14 +114,14 @@ impl DaosObjSyncOps for DaosObject {
     }
 
     fn open(
-        cont: &DaosContainer,
-        oid: daos_obj_id_t,
-        read_only: bool,
+        _cont: &DaosContainer,
+        _oid: daos_obj_id_t,
+        _read_only: bool,
     ) -> Result<Box<DaosObject>> {
         Err(Error::new(ErrorKind::Other, "Not implemented"))
     }
 
-    fn punch(&self, txn: &DaosTxn) -> Result<()> {
+    fn punch(&self, _txn: &DaosTxn) -> Result<()> {
         Err(Error::new(ErrorKind::Other, "Not implemented"))
     }
 
@@ -204,17 +204,20 @@ impl DaosObjAsyncOps for DaosObject {
         args: u32,
     ) -> impl Future<Output = Result<Box<DaosObject>>> + Send + 'static {
         let eq = cont.get_event_queue();
-        let eqh = eq.map(|eq| eq.get_handle());
+        let eqh = eq.map(|eq| eq.get_handle().unwrap());
         let evt = eq.map(|e| e.create_event());
         let cont_hdl = cont.get_handle();
         async move {
+            if cont_hdl.is_none() {
+                return Err(Error::new(ErrorKind::InvalidInput, "empty container handle"));
+            }
             if evt.is_none() {
                 return Err(Error::new(ErrorKind::InvalidData, "event queue is nil"));
             }
 
             let mut oid = daos_obj_id_t { lo: 0, hi: 0 };
             let ret =
-                unsafe { daos_obj_generate_oid2(cont_hdl, &mut oid, otype, cid, hints, args) };
+                unsafe { daos_obj_generate_oid2(cont_hdl.unwrap(), &mut oid, otype, cid, hints, args) };
             if ret != 0 {
                 return Err(Error::new(ErrorKind::Other, "can't generate object id"));
             }
@@ -234,7 +237,7 @@ impl DaosObjAsyncOps for DaosObject {
             let mut obj_hdl = daos_handle_t { cookie: 0u64 };
             let ret = unsafe {
                 daos_obj_open(
-                    cont_hdl,
+                    cont_hdl.unwrap(),
                     oid,
                     DAOS_OO_RW,
                     &mut obj_hdl,
@@ -267,10 +270,13 @@ impl DaosObjAsyncOps for DaosObject {
         read_only: bool,
     ) -> impl Future<Output = Result<Box<DaosObject>>> + Send + 'static {
         let eq = cont.get_event_queue();
-        let eqh = eq.map(|eq| eq.get_handle());
+        let eqh = eq.map(|eq| eq.get_handle().unwrap());
         let evt = eq.map(|e| e.create_event());
         let cont_hdl = cont.get_handle();
         async move {
+            if cont_hdl.is_none() {
+                return Err(Error::new(ErrorKind::InvalidInput, "empty container handle"));
+            }
             if evt.is_none() {
                 return Err(Error::new(ErrorKind::InvalidData, "event queue is nil"));
             }
@@ -290,7 +296,7 @@ impl DaosObjAsyncOps for DaosObject {
             let mut obj_hdl = daos_handle_t { cookie: 0u64 };
             let ret = unsafe {
                 daos_obj_open(
-                    cont_hdl,
+                    cont_hdl.unwrap(),
                     oid,
                     if read_only { DAOS_OO_RO } else { DAOS_OO_RW },
                     &mut obj_hdl,
@@ -317,7 +323,7 @@ impl DaosObjAsyncOps for DaosObject {
 
     fn punch_async(&self, txn: &DaosTxn) -> impl Future<Output = Result<()>> + Send + 'static {
         let eq = self.get_event_queue().clone();
-        let obj_hdl = self.get_handle().clone();
+        let obj_hdl = self.get_handle();
         let tx_hdl = txn.get_handle().clone();
         async move {
             if eq.is_none() {
@@ -374,7 +380,7 @@ impl DaosObjAsyncOps for DaosObject {
         max_size: u32,
     ) -> impl Future<Output = Result<Vec<u8>>> + Send + 'static {
         let eq = self.get_event_queue().clone();
-        let obj_hdl = self.get_handle().clone();
+        let obj_hdl = self.get_handle();
         let tx_hdl = txn.get_handle().clone();
         async move {
             if eq.is_none() {
@@ -473,7 +479,7 @@ impl DaosObjAsyncOps for DaosObject {
         data: Vec<u8>,
     ) -> impl Future<Output = Result<()>> + Send + 'static {
         let eq = self.get_event_queue().clone();
-        let obj_hdl = self.get_handle().clone();
+        let obj_hdl = self.get_handle();
         let tx_hdl = txn.get_handle().clone();
         async move {
             if eq.is_none() {

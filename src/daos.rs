@@ -26,9 +26,11 @@ use std::{
 
 use crate::async_utils::*;
 use crate::bindings::{
-    daos_cont_close, daos_cont_open2, daos_event_t, daos_handle_t, daos_init, daos_obj_close,
-    daos_obj_id_t, daos_pool_connect2, daos_pool_disconnect, daos_tx_abort, daos_tx_close,
-    daos_tx_commit, daos_tx_open, DAOS_COO_RW, DAOS_PC_RW,
+    daos_cont_close, daos_cont_open2, daos_cont_props_DAOS_PROP_CO_ROOTS, daos_cont_query,
+    daos_event_t, daos_handle_t, daos_init, daos_obj_close, daos_obj_id_t, daos_pool_connect2,
+    daos_pool_disconnect, daos_prop_alloc, daos_prop_co_roots, daos_prop_entry_get, daos_prop_free,
+    daos_prop_t, daos_tx_abort, daos_tx_close, daos_tx_commit, daos_tx_open, DAOS_COO_RW,
+    DAOS_PC_RW,
 };
 
 pub type DaosObjectId = daos_obj_id_t;
@@ -117,6 +119,76 @@ impl Drop for DaosPool {
 }
 
 #[derive(Debug)]
+pub struct DaosProperty {
+    raw_prop: Option<*mut daos_prop_t>,
+}
+
+unsafe impl Send for DaosProperty {}
+
+impl DaosProperty {
+    fn new() -> Result<Self> {
+        let prop = unsafe { daos_prop_alloc(1) };
+        if !prop.is_null() {
+            Ok(DaosProperty {
+                raw_prop: Some(prop),
+            })
+        } else {
+            Err(Error::new(
+                ErrorKind::Other,
+                "Failed to allocate DAOS property",
+            ))
+        }
+    }
+
+    pub fn get_co_roots(&self) -> Result<Box<[DaosObjectId; 4]>> {
+        let entry = unsafe {
+            daos_prop_entry_get(
+                self.raw_prop.clone().unwrap(),
+                daos_cont_props_DAOS_PROP_CO_ROOTS,
+            )
+        };
+        if entry.is_null() {
+            return Err(Error::new(
+                ErrorKind::Other,
+                "Failed to get a CO roots prop entry",
+            ));
+        }
+
+        let raw_roots = unsafe {
+            (*entry).__bindgen_anon_1.dpe_val_ptr as *mut daos_prop_co_roots
+        };
+
+        if raw_roots.is_null() {
+            return Err(Error::new(
+                ErrorKind::Other,
+                "empty CO roots in the prop entry",
+            ));
+        }
+
+        let roots = Box::new(unsafe { (*raw_roots).cr_oids });
+        Ok(roots)
+    }
+}
+
+impl Drop for DaosProperty {
+    fn drop(&mut self) {
+        if self.raw_prop.is_some() {
+            unsafe {
+                daos_prop_free(self.raw_prop.unwrap());
+            }
+        }
+    }
+}
+
+pub trait DaosContainerSyncOps {
+    fn query_prop(&self) -> Result<DaosProperty>;
+}
+
+pub trait DaosContainerAsyncOps {
+    fn query_prop_async(&self) -> impl Future<Output = Result<DaosProperty>> + Send + 'static;
+}
+
+#[derive(Debug)]
 pub struct DaosContainer {
     pub label: String,
     handle: Option<daos_handle_t>,
@@ -132,8 +204,8 @@ impl DaosContainer {
         }
     }
 
-    pub fn get_handle(&self) -> daos_handle_t {
-        self.handle.unwrap()
+    pub fn get_handle(&self) -> Option<daos_handle_t> {
+        self.handle.clone()
     }
 
     pub fn get_event_queue(&self) -> Option<&DaosEventQueue> {
@@ -142,7 +214,7 @@ impl DaosContainer {
 
     // Should not be called in async executer like tokio.
     // Consider spawning a new thread to open/close containers.
-    pub fn connect(&mut self, daos_pool: & DaosPool) -> Result<()> {
+    pub fn connect(&mut self, daos_pool: &DaosPool) -> Result<()> {
         if self.handle.is_some() {
             return Ok(());
         }
@@ -221,6 +293,70 @@ impl Drop for DaosContainer {
     }
 }
 
+impl DaosContainerAsyncOps for DaosContainer {
+    fn query_prop_async(&self) -> impl Future<Output = Result<DaosProperty>> + Send + 'static {
+        let cont_hdl = self.handle.clone();
+        let eq = self.get_event_queue();
+        let ev = eq.map(|e| e.create_event());
+
+        async move {
+            if ev.is_none() {
+                return Err(Error::new(ErrorKind::InvalidInput, "empty event queue"));
+            }
+            let ev_res = ev.unwrap();
+            if ev_res.is_err() {
+                return Err(ev_res.unwrap_err());
+            }
+
+            let mut event = ev_res.unwrap();
+
+            let res = event.register_callback();
+            if res.is_err() {
+                return Err(res.unwrap_err());
+            }
+
+            let rx = res.unwrap();
+
+            let res = DaosProperty::new();
+            if res.is_err() {
+                return Err(res.unwrap_err());
+            }
+
+            let prop = res.unwrap();
+
+            let ret = unsafe {
+                daos_cont_query(
+                    cont_hdl.unwrap(),
+                    ptr::null_mut(),
+                    prop.raw_prop.clone().unwrap(),
+                    event.as_mut(),
+                )
+            };
+
+            if ret != 0 {
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    "Failed to query DAOS container",
+                ));
+            }
+
+            match rx.await {
+                Ok(res) => {
+                    if res != 0 {
+                        Err(Error::new(ErrorKind::Other, "async query container failed"))
+                    } else {
+                        Ok(prop)
+                    }
+                }
+                Err(_) => Err(Error::new(
+                    ErrorKind::Other,
+                    "can't get response from the receiver",
+                )),
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct DaosObject {
     pub oid: daos_obj_id_t,
@@ -241,8 +377,8 @@ impl DaosObject {
         }
     }
 
-    pub fn get_handle(&self) -> &Option<daos_handle_t> {
-        &self.handle
+    pub fn get_handle(&self) -> Option<daos_handle_t> {
+        self.handle.clone()
     }
 
     pub fn get_event_queue(&self) -> &Option<daos_handle_t> {
@@ -288,8 +424,8 @@ impl DaosTxn {
             event_que: None,
         }
     }
-    pub fn get_handle(&self) -> &Option<daos_handle_t> {
-        &self.handle
+    pub fn get_handle(&self) -> Option<daos_handle_t> {
+        self.handle.clone()
     }
 }
 
@@ -317,9 +453,15 @@ impl DaosTxnAsyncOps for DaosTxn {
     ) -> impl Future<Output = Result<Box<DaosTxn>>> + Send + 'static {
         let cont_hdl = cont.get_handle();
         let eq = cont.get_event_queue();
-        let eqh = eq.map(|e| e.get_handle());
+        let eqh = eq.map(|e| e.get_handle().unwrap());
         let evt = eq.map(|e| e.create_event());
         async move {
+            if cont_hdl.is_none() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "empty container handle",
+                ));
+            }
             if evt.is_none() {
                 return Err(Error::new(ErrorKind::InvalidInput, "empty event queue"));
             }
@@ -338,7 +480,7 @@ impl DaosTxnAsyncOps for DaosTxn {
             let mut tx_hdl = daos_handle_t { cookie: 0u64 };
             let res = unsafe {
                 daos_tx_open(
-                    cont_hdl,
+                    cont_hdl.unwrap(),
                     &mut tx_hdl,
                     flags,
                     event.as_mut() as *mut daos_event_t,
@@ -374,7 +516,7 @@ impl DaosTxnAsyncOps for DaosTxn {
     }
 
     fn commit_async(&self) -> impl Future<Output = Result<()>> + Send + 'static {
-        let txn_hdl = self.handle.clone();
+        let txn_hdl = self.handle;
         let eq: Option<_> = self.event_que.clone();
         async move {
             if txn_hdl.is_none() || eq.is_none() {
@@ -418,7 +560,7 @@ impl DaosTxnAsyncOps for DaosTxn {
     }
 
     fn abort_async(&self) -> impl Future<Output = Result<()>> + Send + 'static {
-        let tx_hdl = self.handle.clone();
+        let tx_hdl = self.get_handle();
         let eq = self.event_que.clone();
         async move {
             if tx_hdl.is_none() || eq.is_none() {
@@ -462,7 +604,7 @@ impl DaosTxnAsyncOps for DaosTxn {
     }
 
     fn close_async(&self) -> impl Future<Output = Result<()>> + Send + 'static {
-        let tx_hdl = self.handle.clone();
+        let tx_hdl = self.get_handle();
         let eq = self.event_que.clone();
         async move {
             if tx_hdl.is_none() || eq.is_none() {
