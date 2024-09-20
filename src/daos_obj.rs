@@ -17,12 +17,13 @@
 
 use crate::daos_event::*;
 use crate::bindings::{
-    d_iov_t, d_sg_list_t, daos_anchor_is_eof, daos_anchor_t, daos_event_t, daos_handle_t,
+    d_iov_t, d_sg_list_t, daos_anchor_is_eof, daos_anchor_t, daos_event_t,
     daos_iod_t, daos_iod_type_t_DAOS_IOD_SINGLE, daos_key_desc_t, daos_key_t, daos_obj_fetch,
-    daos_obj_generate_oid2, daos_obj_id_t, daos_obj_list_dkey, daos_obj_open, daos_obj_punch,
+    daos_obj_generate_oid2, daos_obj_list_dkey, daos_obj_open, daos_obj_punch,
     daos_obj_update, daos_oclass_hints_t, daos_oclass_id_t, daos_otype_t, DAOS_ANCHOR_BUF_MAX,
     DAOS_OO_RO, DAOS_OO_RW, DAOS_REC_ANY, DAOS_TXN_NONE, daos_obj_close,
 };
+use crate::daos_pool::{DaosHandle, DaosObjectId};
 use crate::daos_cont::DaosContainer;
 use crate::daos_txn::DaosTxn;
 use std::cmp::{Eq, PartialEq};
@@ -42,16 +43,14 @@ pub const DAOS_OC_HINTS_NONE: daos_oclass_hints_t = 0;
 pub const DAOS_COND_DKEY_INSERT: u32 = crate::bindings::DAOS_COND_DKEY_INSERT;
 pub const DAOS_COND_DKEY_UPDATE: u32 = crate::bindings::DAOS_COND_DKEY_UPDATE;
 
-pub type DaosObjectId = daos_obj_id_t;
-
-impl Hash for daos_obj_id_t {
+impl Hash for DaosObjectId {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.lo.hash(state);
         self.hi.hash(state);
     }
 }
 
-impl PartialEq for daos_obj_id_t {
+impl PartialEq for DaosObjectId {
     fn eq(&self, other: &Self) -> bool {
         self.lo == other.lo && self.hi == other.hi
     }
@@ -60,20 +59,20 @@ impl PartialEq for daos_obj_id_t {
     }
 }
 
-impl Eq for daos_obj_id_t {}
+impl Eq for DaosObjectId {}
 
 #[derive(Debug)]
 pub struct DaosObject {
-    pub oid: daos_obj_id_t,
-    handle: Option<daos_handle_t>,
-    event_que: Option<daos_handle_t>,
+    pub oid: DaosObjectId,
+    handle: Option<DaosHandle>,
+    event_que: Option<DaosHandle>,
 }
 
 impl DaosObject {
-    pub(crate) fn new(
-        id: daos_obj_id_t,
-        hdl: daos_handle_t,
-        evt_que: Option<daos_handle_t>,
+    fn new(
+        id: DaosObjectId,
+        hdl: DaosHandle,
+        evt_que: Option<DaosHandle>,
     ) -> Self {
         DaosObject {
             oid: id,
@@ -82,11 +81,11 @@ impl DaosObject {
         }
     }
 
-    pub fn get_handle(&self) -> Option<daos_handle_t> {
+    pub fn get_handle(&self) -> Option<DaosHandle> {
         self.handle.clone()
     }
 
-    pub fn get_event_queue(&self) -> &Option<daos_handle_t> {
+    pub fn get_event_queue(&self) -> &Option<DaosHandle> {
         &self.event_que
     }
 
@@ -177,7 +176,7 @@ pub trait DaosObjSyncOps {
         hints: daos_oclass_hints_t,
         args: u32,
     ) -> Result<Box<DaosObject>>;
-    fn open(cont: &DaosContainer, oid: daos_obj_id_t, read_only: bool) -> Result<Box<DaosObject>>;
+    fn open(cont: &DaosContainer, oid: DaosObjectId, read_only: bool) -> Result<Box<DaosObject>>;
     fn punch(&self, txn: &DaosTxn) -> Result<()>;
     fn update(
         &self,
@@ -199,7 +198,7 @@ pub trait DaosObjAsyncOps {
     ) -> impl Future<Output = Result<Box<DaosObject>>> + Send + 'static;
     fn open_async(
         cont: &DaosContainer,
-        oid: daos_obj_id_t,
+        oid: DaosObjectId,
         read_only: bool,
     ) -> impl Future<Output = Result<Box<DaosObject>>> + Send + 'static;
     fn punch_async(&self, txn: &DaosTxn) -> impl Future<Output = Result<()>> + Send + 'static;
@@ -238,7 +237,7 @@ impl DaosObjSyncOps for DaosObject {
         let eq = cont.get_event_queue();
         let eqh = eq.map(|eq| eq.get_handle().unwrap());
 
-        let mut oid = daos_obj_id_t { lo: 0, hi: 0 };
+        let mut oid = DaosObjectId { lo: 0, hi: 0 };
         let ret =
             unsafe { daos_obj_generate_oid2(cont_hdl.unwrap(), &mut oid, otype, cid, hints, args) };
 
@@ -246,7 +245,7 @@ impl DaosObjSyncOps for DaosObject {
             return Err(Error::new(ErrorKind::Other, "can't generate object id"));
         }
 
-        let mut obj_hdl = daos_handle_t { cookie: 0u64 };
+        let mut obj_hdl = DaosHandle { cookie: 0u64 };
         let ret = unsafe {
             daos_obj_open(
                 cont_hdl.unwrap(),
@@ -266,7 +265,7 @@ impl DaosObjSyncOps for DaosObject {
 
     fn open(
         _cont: &DaosContainer,
-        _oid: daos_obj_id_t,
+        _oid: DaosObjectId,
         _read_only: bool,
     ) -> Result<Box<DaosObject>> {
         Err(Error::new(ErrorKind::Other, "Not implemented"))
@@ -369,7 +368,7 @@ impl DaosObjAsyncOps for DaosObject {
                 return Err(Error::new(ErrorKind::InvalidData, "event queue is nil"));
             }
 
-            let mut oid = daos_obj_id_t { lo: 0, hi: 0 };
+            let mut oid = DaosObjectId { lo: 0, hi: 0 };
             let ret = unsafe {
                 daos_obj_generate_oid2(cont_hdl.unwrap(), &mut oid, otype, cid, hints, args)
             };
@@ -380,7 +379,7 @@ impl DaosObjAsyncOps for DaosObject {
             let mut event = evt.unwrap()?;
             let rx = event.register_callback()?;
 
-            let mut obj_hdl = Box::new(daos_handle_t { cookie: 0u64 });
+            let mut obj_hdl = Box::new(DaosHandle { cookie: 0u64 });
             let ret = unsafe {
                 daos_obj_open(
                     cont_hdl.unwrap(),
@@ -412,7 +411,7 @@ impl DaosObjAsyncOps for DaosObject {
 
     fn open_async(
         cont: &DaosContainer,
-        oid: daos_obj_id_t,
+        oid: DaosObjectId,
         read_only: bool,
     ) -> impl Future<Output = Result<Box<DaosObject>>> + Send + 'static {
         let eq = cont.get_event_queue();
@@ -433,7 +432,7 @@ impl DaosObjAsyncOps for DaosObject {
             let mut event = evt.unwrap()?;
             let rx = event.register_callback()?;
 
-            let mut obj_hdl = Box::new(daos_handle_t { cookie: 0u64 });
+            let mut obj_hdl = Box::new(DaosHandle { cookie: 0u64 });
             let ret = unsafe {
                 daos_obj_open(
                     cont_hdl.unwrap(),

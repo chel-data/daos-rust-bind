@@ -17,8 +17,9 @@
 
 use crate::daos_event::DaosEvent;
 use crate::bindings::{
-    daos_event_t, daos_handle_t, daos_tx_abort, daos_tx_close, daos_tx_commit, daos_tx_open,
+    daos_event_t, daos_tx_abort, daos_tx_close, daos_tx_commit, daos_tx_open,
 };
+use crate::daos_pool::DaosHandle;
 use crate::daos_cont::DaosContainer;
 use std::future::Future;
 use std::{
@@ -27,8 +28,8 @@ use std::{
 };
 
 pub struct DaosTxn {
-    handle: Option<daos_handle_t>,
-    event_que: Option<daos_handle_t>,
+    handle: Option<DaosHandle>,
+    event_que: Option<DaosHandle>,
 }
 
 impl DaosTxn {
@@ -38,7 +39,7 @@ impl DaosTxn {
             event_que: None,
         }
     }
-    pub fn get_handle(&self) -> Option<daos_handle_t> {
+    pub fn get_handle(&self) -> Option<DaosHandle> {
         self.handle.clone()
     }
 }
@@ -91,7 +92,7 @@ impl DaosTxnAsyncOps for DaosTxn {
             }
             let rx = res.unwrap();
 
-            let mut tx_hdl = daos_handle_t { cookie: 0u64 };
+            let mut tx_hdl = DaosHandle { cookie: 0u64 };
             let res = unsafe {
                 daos_tx_open(
                     cont_hdl.unwrap(),

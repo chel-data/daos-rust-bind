@@ -16,7 +16,7 @@
  */
 
 use crate::bindings::{
-    daos_handle_t, daos_init, daos_pool_connect2, daos_pool_disconnect, DAOS_PC_RW,
+    daos_handle_t, daos_init, daos_obj_id_t, daos_pool_connect2, daos_pool_disconnect, DAOS_PC_RW,
 };
 use std::ffi::CString;
 use std::sync::Once;
@@ -27,13 +27,14 @@ use std::{
 };
 
 pub type DaosHandle = daos_handle_t;
+pub type DaosObjectId = daos_obj_id_t;
 
 static INIT_DAOS: Once = Once::new();
 
 #[derive(Debug)]
 pub struct DaosPool {
     pub label: String,
-    handle: Option<daos_handle_t>,
+    handle: Option<DaosHandle>,
 }
 
 impl DaosPool {
@@ -48,7 +49,7 @@ impl DaosPool {
         }
     }
 
-    pub(crate) fn get_handle(&self) -> Option<daos_handle_t> {
+    pub(crate) fn get_handle(&self) -> Option<DaosHandle> {
         self.handle.clone()
     }
 
@@ -60,7 +61,7 @@ impl DaosPool {
         }
 
         let c_label = CString::new(self.label.clone()).unwrap();
-        let mut poh: daos_handle_t = daos_handle_t { cookie: 0u64 };
+        let mut poh: DaosHandle = DaosHandle { cookie: 0u64 };
         let res = unsafe {
             daos_pool_connect2(
                 c_label.as_ptr(),

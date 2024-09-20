@@ -17,11 +17,10 @@
 
 use crate::daos_event::*;
 use crate::bindings::{
-    daos_cont_close, daos_cont_open2, daos_cont_props_DAOS_PROP_CO_ROOTS, daos_cont_query,
-    daos_handle_t, daos_obj_id_t, daos_prop_alloc, daos_prop_co_roots, daos_prop_entry_get,
+    daos_cont_close, daos_cont_open2, daos_cont_props_DAOS_PROP_CO_ROOTS, daos_cont_query, daos_prop_alloc, daos_prop_co_roots, daos_prop_entry_get,
     daos_prop_free, daos_prop_t, DAOS_COO_RW,
 };
-use crate::daos_pool::DaosPool;
+use crate::daos_pool::{DaosHandle, DaosObjectId, DaosPool};
 use std::ffi::CString;
 use std::future::Future;
 use std::io::{Error, ErrorKind, Result};
@@ -49,7 +48,7 @@ impl DaosProperty {
         }
     }
 
-    pub fn get_co_roots(&self) -> Result<Box<[daos_obj_id_t; 4]>> {
+    pub fn get_co_roots(&self) -> Result<Box<[DaosObjectId; 4]>> {
         let entry = unsafe {
             daos_prop_entry_get(
                 self.raw_prop.clone().unwrap(),
@@ -98,7 +97,7 @@ pub trait DaosContainerAsyncOps {
 #[derive(Debug)]
 pub struct DaosContainer {
     pub label: String,
-    handle: Option<daos_handle_t>,
+    handle: Option<DaosHandle>,
     event_queue: Option<DaosEventQueue>,
 }
 
@@ -111,7 +110,7 @@ impl DaosContainer {
         }
     }
 
-    pub fn get_handle(&self) -> Option<daos_handle_t> {
+    pub fn get_handle(&self) -> Option<DaosHandle> {
         self.handle.clone()
     }
 
@@ -131,7 +130,7 @@ impl DaosContainer {
         }
 
         let c_label = CString::new(self.label.clone()).unwrap();
-        let mut coh: daos_handle_t = daos_handle_t { cookie: 0u64 };
+        let mut coh: DaosHandle = DaosHandle { cookie: 0u64 };
         let res = unsafe {
             daos_cont_open2(
                 daos_pool.get_handle().unwrap(),
