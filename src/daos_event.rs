@@ -15,17 +15,16 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use std::io::{Error, ErrorKind, Result};
-use std::ptr;
-use std::sync::mpsc;
-use std::thread;
-use tokio::sync::oneshot;
-
 use crate::bindings::{
     daos_eq_create, daos_eq_destroy, daos_eq_poll, daos_event__bindgen_ty_1, daos_event_fini,
     daos_event_init, daos_event_register_comp_cb, daos_event_t, daos_event_test, daos_handle_t,
     DAOS_EQ_NOWAIT,
 };
+use std::io::{Error, ErrorKind, Result};
+use std::ptr;
+use std::sync::mpsc;
+use std::thread;
+use tokio::sync::oneshot;
 
 #[derive(Debug)]
 pub struct CallbackArg {
@@ -160,7 +159,11 @@ impl DaosEventQueue {
         });
 
         if res == 0 {
-            Ok(DaosEventQueue { handle: Some(eqh), sender: snd, thread_handle: Some(t_handle) })
+            Ok(DaosEventQueue {
+                handle: Some(eqh),
+                sender: snd,
+                thread_handle: Some(t_handle),
+            })
         } else {
             Err(Error::new(ErrorKind::Other, "can't create event queue"))
         }
@@ -182,7 +185,7 @@ impl Drop for DaosEventQueue {
                 Ok(_) => {
                     let join_handle = self.thread_handle.take();
                     let _ = join_handle.unwrap().join();
-                },
+                }
                 Err(_) => return,
             };
 
@@ -200,7 +203,7 @@ impl Drop for DaosEventQueue {
 mod tests {
     use super::*;
 
-    use crate::daos::DaosPool;
+    use crate::daos_pool::DaosPool;
 
     #[tokio::test]
     async fn test_create_async_event1() {
@@ -210,7 +213,7 @@ mod tests {
         let mut evt = eqh.create_event().unwrap();
         assert!(evt.event.is_some());
 
-        let rx = evt.register_callback().unwrap();
+        let _rx = evt.register_callback().unwrap();
     }
 
     #[test]

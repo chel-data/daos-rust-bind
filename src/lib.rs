@@ -15,11 +15,13 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-mod async_utils;
+mod daos_event;
 #[allow(unused)]
 mod bindings;
-pub mod daos;
-pub mod daos_obj_ops;
+pub mod daos_pool;
+pub mod daos_cont;
+pub mod daos_obj;
+pub mod daos_txn;
 
 pub fn add(left: usize, right: usize) -> usize {
     left + right

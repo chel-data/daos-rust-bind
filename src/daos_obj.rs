@@ -15,18 +15,159 @@
 //  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 //
 
+use crate::daos_event::*;
+use crate::bindings::{
+    d_iov_t, d_sg_list_t, daos_anchor_is_eof, daos_anchor_t, daos_event_t, daos_handle_t,
+    daos_iod_t, daos_iod_type_t_DAOS_IOD_SINGLE, daos_key_desc_t, daos_key_t, daos_obj_fetch,
+    daos_obj_generate_oid2, daos_obj_id_t, daos_obj_list_dkey, daos_obj_open, daos_obj_punch,
+    daos_obj_update, daos_oclass_hints_t, daos_oclass_id_t, daos_otype_t, DAOS_ANCHOR_BUF_MAX,
+    DAOS_OO_RO, DAOS_OO_RW, DAOS_REC_ANY, DAOS_TXN_NONE, daos_obj_close,
+};
+use crate::daos_cont::DaosContainer;
+use crate::daos_txn::DaosTxn;
+use std::cmp::{Eq, PartialEq};
 use std::future::Future;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::io::{Error, ErrorKind, Result};
 use std::ptr;
+use std::vec::Vec;
 
-use crate::async_utils::*;
-use crate::bindings::{
-    d_iov_t, d_sg_list_t, daos_event_t, daos_handle_t, daos_iod_t, daos_iod_type_t_DAOS_IOD_SINGLE,
-    daos_key_t, daos_obj_fetch, daos_obj_generate_oid2, daos_obj_id_t, daos_obj_open,
-    daos_obj_punch, daos_obj_update, daos_oclass_hints_t, daos_oclass_id_t, daos_otype_t,
-    DAOS_OO_RO, DAOS_OO_RW, DAOS_REC_ANY, DAOS_TXN_NONE,
-};
-use crate::daos::{DaosContainer, DaosObject, DaosTxn};
+const MAX_KEY_DESCS: u32 = 128;
+const KEY_BUF_SIZE: usize = 1024;
+
+pub const DAOS_OT_ARRAY_BYTE: daos_otype_t = crate::bindings::daos_otype_t_DAOS_OT_ARRAY_BYTE;
+pub const DAOS_OC_UNKNOWN: daos_oclass_id_t = crate::bindings::OC_UNKNOWN;
+pub const DAOS_OC_HINTS_NONE: daos_oclass_hints_t = 0;
+pub const DAOS_COND_DKEY_INSERT: u32 = crate::bindings::DAOS_COND_DKEY_INSERT;
+pub const DAOS_COND_DKEY_UPDATE: u32 = crate::bindings::DAOS_COND_DKEY_UPDATE;
+
+pub type DaosObjectId = daos_obj_id_t;
+
+impl Hash for daos_obj_id_t {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.lo.hash(state);
+        self.hi.hash(state);
+    }
+}
+
+impl PartialEq for daos_obj_id_t {
+    fn eq(&self, other: &Self) -> bool {
+        self.lo == other.lo && self.hi == other.hi
+    }
+    fn ne(&self, other: &Self) -> bool {
+        self.lo != other.lo || self.hi != other.hi
+    }
+}
+
+impl Eq for daos_obj_id_t {}
+
+#[derive(Debug)]
+pub struct DaosObject {
+    pub oid: daos_obj_id_t,
+    handle: Option<daos_handle_t>,
+    event_que: Option<daos_handle_t>,
+}
+
+impl DaosObject {
+    pub(crate) fn new(
+        id: daos_obj_id_t,
+        hdl: daos_handle_t,
+        evt_que: Option<daos_handle_t>,
+    ) -> Self {
+        DaosObject {
+            oid: id,
+            handle: Some(hdl),
+            event_que: evt_que,
+        }
+    }
+
+    pub fn get_handle(&self) -> Option<daos_handle_t> {
+        self.handle.clone()
+    }
+
+    pub fn get_event_queue(&self) -> &Option<daos_handle_t> {
+        &self.event_que
+    }
+
+    fn close(&mut self) -> Result<()> {
+        if self.handle.is_some() {
+            let res = unsafe { daos_obj_close(self.handle.unwrap(), ptr::null_mut()) };
+            if res == 0 {
+                self.handle.take();
+                Ok(())
+            } else {
+                Err(Error::new(ErrorKind::Other, "Failed to close DAOS object"))
+            }
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for DaosObject {
+    fn drop(&mut self) {
+        let res = self.close();
+        match res {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Failed to drop DAOS object: {:?}", e);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct DaosKeyList {
+    anchor: Box<daos_anchor_t>,
+    ndesc: Box<u32>,
+    key_descs: Vec<daos_key_desc_t>,
+    out_buf: Vec<u8>,
+}
+
+impl DaosKeyList {
+    pub fn new() -> Box<Self> {
+        let vec = vec![0u8; KEY_BUF_SIZE];
+        Box::new(DaosKeyList {
+            anchor: Box::new(daos_anchor_t {
+                da_type: 0,
+                da_shard: 0,
+                da_flags: 0,
+                da_sub_anchors: 0,
+                da_buf: [0; DAOS_ANCHOR_BUF_MAX as usize],
+            }),
+            ndesc: Box::new(MAX_KEY_DESCS),
+            key_descs: vec![
+                daos_key_desc_t {
+                    kd_key_len: 0,
+                    kd_val_type: 0,
+                };
+                MAX_KEY_DESCS as usize
+            ],
+            out_buf: vec,
+        })
+    }
+
+    pub fn prepare_next_query(&mut self) {
+        *(self.ndesc) = MAX_KEY_DESCS;
+    }
+
+    pub fn reach_end(&self) -> bool {
+        daos_anchor_is_eof(self.anchor.as_ref())
+    }
+
+    // use (0, 0) as start position
+    pub fn get_key(&self, start_and_idx: (u32, u32)) -> Result<(&[u8], (u32, u32))> {
+        let (start, idx) = start_and_idx;
+        if idx >= *self.ndesc {
+            return Err(Error::new(ErrorKind::Other, "index out of range"));
+        }
+        let key_desc = &self.key_descs[idx as usize];
+        let end = start as usize + key_desc.kd_key_len as usize;
+        let key = &self.out_buf[start as usize..end];
+        Ok((key, (end as u32, idx + 1)))
+    }
+}
 
 pub trait DaosObjSyncOps {
     fn create(
@@ -36,11 +177,7 @@ pub trait DaosObjSyncOps {
         hints: daos_oclass_hints_t,
         args: u32,
     ) -> Result<Box<DaosObject>>;
-    fn open(
-        cont: &DaosContainer,
-        oid: daos_obj_id_t,
-        read_only: bool,
-    ) -> Result<Box<DaosObject>>;
+    fn open(cont: &DaosContainer, oid: daos_obj_id_t, read_only: bool) -> Result<Box<DaosObject>>;
     fn punch(&self, txn: &DaosTxn) -> Result<()>;
     fn update(
         &self,
@@ -82,6 +219,11 @@ pub trait DaosObjAsyncOps {
         akey: Vec<u8>,
         data: Vec<u8>,
     ) -> impl Future<Output = Result<()>> + Send + 'static;
+    fn list_dkey_async(
+        &self,
+        txn: &DaosTxn,
+        key_lst: Box<DaosKeyList>,
+    ) -> impl Future<Output = Result<Box<DaosKeyList>>> + Send + 'static;
 }
 
 impl DaosObjSyncOps for DaosObject {
@@ -97,14 +239,23 @@ impl DaosObjSyncOps for DaosObject {
         let eqh = eq.map(|eq| eq.get_handle().unwrap());
 
         let mut oid = daos_obj_id_t { lo: 0, hi: 0 };
-        let ret = unsafe { daos_obj_generate_oid2(cont_hdl.unwrap(), &mut oid, otype, cid, hints, args) };
+        let ret =
+            unsafe { daos_obj_generate_oid2(cont_hdl.unwrap(), &mut oid, otype, cid, hints, args) };
 
         if ret != 0 {
             return Err(Error::new(ErrorKind::Other, "can't generate object id"));
         }
 
         let mut obj_hdl = daos_handle_t { cookie: 0u64 };
-        let ret = unsafe { daos_obj_open(cont_hdl.unwrap(), oid, DAOS_OO_RW, &mut obj_hdl, std::ptr::null_mut()) };
+        let ret = unsafe {
+            daos_obj_open(
+                cont_hdl.unwrap(),
+                oid,
+                DAOS_OO_RW,
+                &mut obj_hdl,
+                std::ptr::null_mut(),
+            )
+        };
 
         if ret != 0 {
             return Err(Error::new(ErrorKind::Other, "can't open object"));
@@ -209,38 +360,33 @@ impl DaosObjAsyncOps for DaosObject {
         let cont_hdl = cont.get_handle();
         async move {
             if cont_hdl.is_none() {
-                return Err(Error::new(ErrorKind::InvalidInput, "empty container handle"));
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "empty container handle",
+                ));
             }
             if evt.is_none() {
                 return Err(Error::new(ErrorKind::InvalidData, "event queue is nil"));
             }
 
             let mut oid = daos_obj_id_t { lo: 0, hi: 0 };
-            let ret =
-                unsafe { daos_obj_generate_oid2(cont_hdl.unwrap(), &mut oid, otype, cid, hints, args) };
+            let ret = unsafe {
+                daos_obj_generate_oid2(cont_hdl.unwrap(), &mut oid, otype, cid, hints, args)
+            };
             if ret != 0 {
                 return Err(Error::new(ErrorKind::Other, "can't generate object id"));
             }
 
-            let res = evt.unwrap();
-            if res.is_err() {
-                return Err(res.unwrap_err());
-            }
-            let mut event = res.unwrap();
+            let mut event = evt.unwrap()?;
+            let rx = event.register_callback()?;
 
-            let res = event.register_callback();
-            if res.is_err() {
-                return Err(res.unwrap_err());
-            }
-            let rx = res.unwrap();
-
-            let mut obj_hdl = daos_handle_t { cookie: 0u64 };
+            let mut obj_hdl = Box::new(daos_handle_t { cookie: 0u64 });
             let ret = unsafe {
                 daos_obj_open(
                     cont_hdl.unwrap(),
                     oid,
                     DAOS_OO_RW,
-                    &mut obj_hdl,
+                    obj_hdl.as_mut(),
                     event.as_mut() as *mut daos_event_t,
                 )
             };
@@ -260,7 +406,7 @@ impl DaosObjAsyncOps for DaosObject {
                 }
             }
 
-            Ok(Box::new(DaosObject::new(oid, obj_hdl, eqh)))
+            Ok(Box::new(DaosObject::new(oid, *obj_hdl, eqh)))
         }
     }
 
@@ -275,31 +421,25 @@ impl DaosObjAsyncOps for DaosObject {
         let cont_hdl = cont.get_handle();
         async move {
             if cont_hdl.is_none() {
-                return Err(Error::new(ErrorKind::InvalidInput, "empty container handle"));
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "empty container handle",
+                ));
             }
             if evt.is_none() {
                 return Err(Error::new(ErrorKind::InvalidData, "event queue is nil"));
             }
 
-            let res = evt.unwrap();
-            if res.is_err() {
-                return Err(res.unwrap_err());
-            }
-            let mut event = res.unwrap();
+            let mut event = evt.unwrap()?;
+            let rx = event.register_callback()?;
 
-            let res = event.register_callback();
-            if res.is_err() {
-                return Err(res.unwrap_err());
-            }
-            let rx = res.unwrap();
-
-            let mut obj_hdl = daos_handle_t { cookie: 0u64 };
+            let mut obj_hdl = Box::new(daos_handle_t { cookie: 0u64 });
             let ret = unsafe {
                 daos_obj_open(
                     cont_hdl.unwrap(),
                     oid,
                     if read_only { DAOS_OO_RO } else { DAOS_OO_RW },
-                    &mut obj_hdl,
+                    obj_hdl.as_mut(),
                     event.as_mut() as *mut daos_event_t,
                 )
             };
@@ -313,7 +453,7 @@ impl DaosObjAsyncOps for DaosObject {
                     if ret != 0 {
                         Err(Error::new(ErrorKind::Other, "async open object fail"))
                     } else {
-                        Ok(Box::new(DaosObject::new(oid, obj_hdl, eqh)))
+                        Ok(Box::new(DaosObject::new(oid, *obj_hdl, eqh)))
                     }
                 }
                 Err(_) => Err(Error::new(ErrorKind::ConnectionReset, "rx is closed early")),
@@ -336,17 +476,8 @@ impl DaosObjAsyncOps for DaosObject {
                 ));
             }
 
-            let res = DaosEvent::new(eq.unwrap());
-            if res.is_err() {
-                return Err(res.unwrap_err());
-            }
-            let mut event = res.unwrap();
-
-            let res = event.register_callback();
-            if res.is_err() {
-                return Err(res.unwrap_err());
-            }
-            let rx = res.unwrap();
+            let mut event = DaosEvent::new(eq.unwrap())?;
+            let rx = event.register_callback()?;
 
             let txn = match tx_hdl {
                 Some(tx) => tx,
@@ -393,17 +524,8 @@ impl DaosObjAsyncOps for DaosObject {
                 ));
             }
 
-            let res = DaosEvent::new(eq.unwrap());
-            if res.is_err() {
-                return Err(res.unwrap_err());
-            }
-            let mut event = res.unwrap();
-
-            let res = event.register_callback();
-            if res.is_err() {
-                return Err(res.unwrap_err());
-            }
-            let rx = res.unwrap();
+            let mut event = DaosEvent::new(eq.unwrap())?;
+            let rx = event.register_callback()?;
 
             let txn = match tx_hdl {
                 Some(tx) => tx,
@@ -430,7 +552,7 @@ impl DaosObjAsyncOps for DaosObject {
             let mut buf = Vec::with_capacity(max_size as usize);
             buf.resize(max_size as usize, 0u8);
             let mut sg_iov = Box::new(d_iov_t {
-                iov_buf: buf.as_ptr() as *mut u8 as *mut std::os::raw::c_void,
+                iov_buf: buf.as_mut_ptr() as *mut std::os::raw::c_void,
                 iov_buf_len: buf.len(),
                 iov_len: buf.len(),
             });
@@ -492,17 +614,8 @@ impl DaosObjAsyncOps for DaosObject {
                 ));
             }
 
-            let res = DaosEvent::new(eq.unwrap());
-            if res.is_err() {
-                return Err(res.unwrap_err());
-            }
-            let mut event = res.unwrap();
-
-            let res = event.register_callback();
-            if res.is_err() {
-                return Err(res.unwrap_err());
-            }
-            let rx = res.unwrap();
+            let mut event = DaosEvent::new(eq.unwrap())?;
+            let rx = event.register_callback()?;
 
             let txn = match tx_hdl {
                 Some(tx) => tx,
@@ -549,15 +662,97 @@ impl DaosObjAsyncOps for DaosObject {
                 )
             };
             if ret != 0 {
-                return Err(Error::new(ErrorKind::Other, "can't update object"));
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    format!("can't update object, ret={}", ret),
+                ));
             }
 
             match rx.await {
                 Ok(ret) => {
                     if ret != 0 {
-                        Err(Error::new(ErrorKind::Other, "async update operation fail"))
+                        Err(Error::new(
+                            ErrorKind::Other,
+                            format!("async update operation fail, ret={}", ret),
+                        ))
                     } else {
                         Ok(())
+                    }
+                }
+                Err(_) => Err(Error::new(ErrorKind::ConnectionReset, "rx is closed early")),
+            }
+        }
+    }
+
+    fn list_dkey_async(
+        &self,
+        txn: &DaosTxn,
+        key_lst: Box<DaosKeyList>,
+    ) -> impl Future<Output = Result<Box<DaosKeyList>>> + Send + 'static {
+        let eq = self.get_event_queue().clone();
+        let obj_hdl = self.get_handle();
+        let tx_hdl = txn.get_handle().clone();
+        async move {
+            if eq.is_none() {
+                return Err(Error::new(ErrorKind::InvalidData, "event queue is nil"));
+            }
+            if obj_hdl.is_none() {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "list uninitialized object",
+                ));
+            }
+
+            let mut key_lst = key_lst;
+
+            let mut event = DaosEvent::new(eq.unwrap())?;
+            let rx = event.register_callback()?;
+
+            let txn = match tx_hdl {
+                Some(tx) => tx,
+                None => DAOS_TXN_NONE,
+            };
+
+            key_lst.prepare_next_query();
+
+            let mut sg_iov = Box::new(d_iov_t {
+                iov_buf: key_lst.out_buf.as_mut_ptr() as *mut std::os::raw::c_void,
+                iov_buf_len: key_lst.out_buf.len(),
+                iov_len: key_lst.out_buf.len(),
+            });
+            let mut sgl = Box::new(d_sg_list_t {
+                sg_nr: 1,
+                sg_nr_out: 0,
+                sg_iovs: sg_iov.as_mut(),
+            });
+
+            let res = unsafe {
+                daos_obj_list_dkey(
+                    obj_hdl.unwrap(),
+                    txn,
+                    key_lst.ndesc.as_mut(),
+                    key_lst.key_descs.as_mut_ptr(),
+                    sgl.as_mut(),
+                    key_lst.anchor.as_mut(),
+                    event.as_mut(),
+                )
+            };
+            if res != 0 {
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    format!("list dkey fail, err={}", res),
+                ));
+            }
+
+            match rx.await {
+                Ok(ret) => {
+                    if ret != 0 {
+                        Err(Error::new(
+                            ErrorKind::Other,
+                            format!("async list dkey fail, ret={}", ret),
+                        ))
+                    } else {
+                        Ok(key_lst)
                     }
                 }
                 Err(_) => Err(Error::new(ErrorKind::ConnectionReset, "rx is closed early")),
@@ -571,7 +766,7 @@ mod tests {
     use super::*;
 
     use crate::bindings::{daos_otype_t_DAOS_OT_MULTI_HASHED, OC_UNKNOWN};
-    use crate::daos::DaosPool;
+    use crate::daos_pool::DaosPool;
 
     const TEST_POOL_NAME: &str = "pool1";
     const TEST_CONT_NAME: &str = "cont1";
@@ -592,7 +787,7 @@ mod tests {
         let result = DaosObject::create(&cont, otype, cid, hints, args);
 
         assert!(result.is_ok());
-        let obj_box = result.unwrap();
+        let _obj_box = result.unwrap();
         // Assert obj_box is created correctly
     }
 
@@ -624,156 +819,195 @@ mod tests {
         // Assert update operation is successful
     }
 
-    #[test]
-    fn test_create_async() {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let mut pool = DaosPool::new(TEST_POOL_NAME);
-                pool.connect().expect("Failed to connect to pool");
+    #[tokio::test]
+    async fn test_create_async() {
+        let mut pool = DaosPool::new(TEST_POOL_NAME);
+        pool.connect().expect("Failed to connect to pool");
 
-                let mut cont = DaosContainer::new(TEST_CONT_NAME);
-                cont.connect(&pool).expect("Failed to connect to container");
+        let mut cont = DaosContainer::new(TEST_CONT_NAME);
+        cont.connect(&pool).expect("Failed to connect to container");
 
-                let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
-                let cid: daos_oclass_id_t = OC_UNKNOWN;
-                let hints: daos_oclass_hints_t = 0;
-                let args = 0;
+        let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
+        let cid: daos_oclass_id_t = OC_UNKNOWN;
+        let hints: daos_oclass_hints_t = 0;
+        let args = 0;
 
-                let result = DaosObject::create_async(&cont, otype, cid, hints, args).await;
+        let result = DaosObject::create_async(&cont, otype, cid, hints, args).await;
 
-                assert!(result.is_ok());
-                let obj_box = result.unwrap();
-                // Assert obj_box is created correctly
-            });
+        assert!(result.is_ok());
+        let _obj_box = result.unwrap();
+        // Assert obj_box is created correctly
     }
 
-    #[test]
-    fn test_open_async() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let mut pool = DaosPool::new(TEST_POOL_NAME);
-                pool.connect().expect("Failed to connect to pool");
+    #[tokio::test]
+    async fn test_open_async() {
+        let mut pool = DaosPool::new(TEST_POOL_NAME);
+        pool.connect().expect("Failed to connect to pool");
 
-                let mut cont = DaosContainer::new(TEST_CONT_NAME);
-                cont.connect(&pool).expect("Failed to connect to container");
+        let mut cont = DaosContainer::new(TEST_CONT_NAME);
+        cont.connect(&pool).expect("Failed to connect to container");
 
-                let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
-                let cid: daos_oclass_id_t = OC_UNKNOWN;
-                let hints: daos_oclass_hints_t = 0;
-                let args = 0;
+        let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
+        let cid: daos_oclass_id_t = OC_UNKNOWN;
+        let hints: daos_oclass_hints_t = 0;
+        let args = 0;
 
-                let result = DaosObject::create_async(&cont, otype, cid, hints, args).await;
-                assert!(result.is_ok());
-                let obj_box = result.unwrap();
+        let result = DaosObject::create_async(&cont, otype, cid, hints, args).await;
+        assert!(result.is_ok());
+        let obj_box = result.unwrap();
 
-                let oid = obj_box.oid;
+        let oid = obj_box.oid;
 
-                let result = DaosObject::open_async(&cont, oid, /* read_only */ true).await;
-                assert!(result.is_ok());
-                let obj = result.unwrap();
-                // Assert obj is opened correctly
-            });
+        let result = DaosObject::open_async(&cont, oid, /* read_only */ true).await;
+        assert!(result.is_ok());
+        let _obj = result.unwrap();
+        // Assert obj is opened correctly
     }
 
-    #[test]
-    fn test_punch_async() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let mut pool = DaosPool::new(TEST_POOL_NAME);
-                pool.connect().expect("Failed to connect to pool");
+    #[tokio::test]
+    async fn test_punch_async() {
+        let mut pool = DaosPool::new(TEST_POOL_NAME);
+        pool.connect().expect("Failed to connect to pool");
 
-                let mut cont = DaosContainer::new(TEST_CONT_NAME);
-                cont.connect(&pool).expect("Failed to connect to container");
+        let mut cont = DaosContainer::new(TEST_CONT_NAME);
+        cont.connect(&pool).expect("Failed to connect to container");
 
-                let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
-                let cid: daos_oclass_id_t = OC_UNKNOWN;
-                let hints: daos_oclass_hints_t = 0;
-                let args = 0;
+        let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
+        let cid: daos_oclass_id_t = OC_UNKNOWN;
+        let hints: daos_oclass_hints_t = 0;
+        let args = 0;
 
-                let result = DaosObject::create_async(&cont, otype, cid, hints, args).await;
-                assert!(result.is_ok());
-                let obj_box = result.unwrap();
+        let result = DaosObject::create_async(&cont, otype, cid, hints, args).await;
+        assert!(result.is_ok());
+        let obj_box = result.unwrap();
 
-                let txn = DaosTxn::txn_none();
-                let result = obj_box.punch_async(&txn).await;
-                assert!(result.is_ok());
-                // Assert punch operation is successful
-            });
+        let txn = DaosTxn::txn_none();
+        let result = obj_box.punch_async(&txn).await;
+        assert!(result.is_ok());
+        // Assert punch operation is successful
     }
 
-    #[test]
-    fn test_fetch_async() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let mut pool = DaosPool::new(TEST_POOL_NAME);
-                pool.connect().expect("Failed to connect to pool");
+    #[tokio::test]
+    async fn test_fetch_async() {
+        let mut pool = DaosPool::new(TEST_POOL_NAME);
+        pool.connect().expect("Failed to connect to pool");
 
-                let mut cont = DaosContainer::new(TEST_CONT_NAME);
-                cont.connect(&pool).expect("Failed to connect to container");
+        let mut cont = DaosContainer::new(TEST_CONT_NAME);
+        cont.connect(&pool).expect("Failed to connect to container");
 
-                let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
-                let cid: daos_oclass_id_t = OC_UNKNOWN;
-                let hints: daos_oclass_hints_t = 0;
-                let args = 0;
+        let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
+        let cid: daos_oclass_id_t = OC_UNKNOWN;
+        let hints: daos_oclass_hints_t = 0;
+        let args = 0;
 
-                let result = DaosObject::create_async(&cont, otype, cid, hints, args).await;
-                assert!(result.is_ok());
-                let obj_box = result.unwrap();
+        let result = DaosObject::create_async(&cont, otype, cid, hints, args).await;
+        assert!(result.is_ok());
+        let obj_box = result.unwrap();
 
-                let txn = DaosTxn::txn_none();
-                let flags = 0;
-                let dkey = vec![0u8, 1u8, 2u8, 3u8];
-                let akey = vec![0u8];
-                let max = 1024;
-                let result = obj_box.fetch_async(&txn, flags, dkey, akey, max).await;
-                assert!(result.is_ok());
-                let data = result.unwrap();
-                // Assert fetched data is correct
-            });
+        let txn = DaosTxn::txn_none();
+        let flags = 0;
+        let dkey = vec![0u8, 1u8, 2u8, 3u8];
+        let akey = vec![0u8];
+        let max = 1024;
+        let result = obj_box.fetch_async(&txn, flags, dkey, akey, max).await;
+        assert!(result.is_ok());
+        let _data = result.unwrap();
+        // Assert fetched data is correct
     }
 
-    #[test]
-    fn test_update_async() {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let mut pool = DaosPool::new(TEST_POOL_NAME);
-                pool.connect().expect("Failed to connect to pool");
+    #[tokio::test]
+    async fn test_update_async() {
+        let mut pool = DaosPool::new(TEST_POOL_NAME);
+        pool.connect().expect("Failed to connect to pool");
 
-                let mut cont = DaosContainer::new(TEST_CONT_NAME);
-                cont.connect(&pool).expect("Failed to connect to container");
+        let mut cont = DaosContainer::new(TEST_CONT_NAME);
+        cont.connect(&pool).expect("Failed to connect to container");
 
-                let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
-                let cid: daos_oclass_id_t = OC_UNKNOWN;
-                let hints: daos_oclass_hints_t = 0;
-                let args = 0;
+        let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
+        let cid: daos_oclass_id_t = OC_UNKNOWN;
+        let hints: daos_oclass_hints_t = 0;
+        let args = 0;
 
-                let result = DaosObject::create_async(&cont, otype, cid, hints, args).await;
-                assert!(result.is_ok());
-                let obj_box = result.unwrap();
+        let result = DaosObject::create_async(&cont, otype, cid, hints, args).await;
+        assert!(result.is_ok());
+        let obj_box = result.unwrap();
 
-                let txn = DaosTxn::txn_none();
-                let flags = 0;
-                let dkey = vec![0u8, 1u8, 2u8, 3u8];
-                let akey = vec![0u8];
-                let data = vec![1u8; 256];
-                let result = obj_box.update_async(&txn, flags, dkey, akey, data).await;
-                assert!(result.is_ok());
-                // Assert update operation is successful
-            });
+        let txn = DaosTxn::txn_none();
+        let flags = 0;
+        let dkey = vec![0u8, 1u8, 2u8, 3u8];
+        let akey = vec![0u8];
+        let data = vec![1u8; 256];
+        let result = obj_box.update_async(&txn, flags, dkey, akey, data).await;
+        assert!(result.is_ok());
+        // Assert update operation is successful
+    }
+
+    #[tokio::test]
+    async fn test_list_dkey_async() {
+        let mut pool = DaosPool::new(TEST_POOL_NAME);
+        pool.connect().expect("Failed to connect to pool");
+
+        let mut cont = DaosContainer::new(TEST_CONT_NAME);
+        cont.connect(&pool).expect("Failed to connect to container");
+
+        let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
+        let cid: daos_oclass_id_t = OC_UNKNOWN;
+        let hints: daos_oclass_hints_t = 0;
+        let args = 0;
+
+        let result = DaosObject::create_async(&cont, otype, cid, hints, args).await;
+        assert!(result.is_ok());
+        let obj_box = result.unwrap();
+
+        let txn = DaosTxn::txn_none();
+        let dkey = "string1".as_bytes().to_vec();
+        let akey = vec![0u8];
+        let data = vec![1u8; 256];
+        let res = obj_box
+            .update_async(&txn, DAOS_COND_DKEY_INSERT as u64, dkey, akey, data)
+            .await;
+        assert!(res.is_ok());
+
+        let dkey = "very_long_string2".as_bytes().to_vec();
+        let akey = vec![0u8];
+        let data = vec![2u8; 256];
+        let res = obj_box
+            .update_async(&txn, DAOS_COND_DKEY_INSERT as u64, dkey, akey, data)
+            .await;
+        assert!(res.is_ok());
+
+        let key_lst = DaosKeyList::new();
+        let result = obj_box.list_dkey_async(&txn, key_lst).await;
+        assert!(result.is_ok());
+        // Assert list dkey operation is successful
+        let key_lst = result.unwrap();
+
+        let off = (0u32, 0u32);
+        let res = key_lst.get_key(off);
+        let off = match res {
+            Ok((key, off)) => {
+                assert_eq!(key, "string1".as_bytes());
+                off
+            }
+            Err(_) => {
+                assert!(false);
+                (0u32, 0u32)
+            }
+        };
+
+        let res = key_lst.get_key(off);
+        let off = match res {
+            Ok((key, off)) => {
+                assert_eq!(key, "very_long_string2".as_bytes());
+                off
+            }
+            Err(_) => {
+                assert!(false);
+                (0u32, 0u32)
+            }
+        };
+
+        let res = key_lst.get_key(off);
+        assert!(res.is_err());
     }
 }
