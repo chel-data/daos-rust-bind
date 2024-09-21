@@ -15,16 +15,17 @@
 //  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 //
 
-use crate::daos_event::*;
 use crate::bindings::{
-    d_iov_t, d_sg_list_t, daos_anchor_is_eof, daos_anchor_t, daos_event_t,
-    daos_iod_t, daos_iod_type_t_DAOS_IOD_SINGLE, daos_key_desc_t, daos_key_t, daos_obj_fetch,
-    daos_obj_generate_oid2, daos_obj_list_dkey, daos_obj_open, daos_obj_punch,
-    daos_obj_update, daos_oclass_hints_t, daos_oclass_id_t, daos_otype_t, DAOS_ANCHOR_BUF_MAX,
-    DAOS_OO_RO, DAOS_OO_RW, DAOS_REC_ANY, DAOS_TXN_NONE, daos_obj_close,
+    d_iov_t, d_sg_list_t, daos_anchor_is_eof, daos_anchor_t, daos_event_t, daos_iod_t,
+    daos_iod_type_t_DAOS_IOD_SINGLE, daos_key_desc_t, daos_key_t, daos_obj_close, daos_obj_fetch,
+    daos_obj_generate_oid2, daos_obj_list_dkey, daos_obj_open, daos_obj_punch, daos_obj_update,
+    daos_oclass_hints_t, daos_oclass_id_t, daos_otype_t, DAOS_ANCHOR_BUF_MAX, DAOS_OO_RO,
+    DAOS_OO_RW, DAOS_REC_ANY, DAOS_TXN_NONE,
 };
-use crate::daos_pool::{DaosHandle, DaosObjectId};
 use crate::daos_cont::DaosContainer;
+use crate::daos_event::*;
+use crate::daos_oid_allocator::{DaosAsyncOidAllocator, DaosSyncOidAllocator};
+use crate::daos_pool::{DaosHandle, DaosObjectId};
 use crate::daos_txn::DaosTxn;
 use std::cmp::{Eq, PartialEq};
 use std::future::Future;
@@ -32,6 +33,7 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::io::{Error, ErrorKind, Result};
 use std::ptr;
+use std::sync::Arc;
 use std::vec::Vec;
 
 const MAX_KEY_DESCS: u32 = 128;
@@ -42,6 +44,7 @@ pub const DAOS_OC_UNKNOWN: daos_oclass_id_t = crate::bindings::OC_UNKNOWN;
 pub const DAOS_OC_HINTS_NONE: daos_oclass_hints_t = 0;
 pub const DAOS_COND_DKEY_INSERT: u32 = crate::bindings::DAOS_COND_DKEY_INSERT;
 pub const DAOS_COND_DKEY_UPDATE: u32 = crate::bindings::DAOS_COND_DKEY_UPDATE;
+pub const DAOS_COND_DKEY_FETCH: u32 = crate::bindings::DAOS_COND_AKEY_FETCH;
 
 impl Hash for DaosObjectId {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -69,11 +72,7 @@ pub struct DaosObject {
 }
 
 impl DaosObject {
-    fn new(
-        id: DaosObjectId,
-        hdl: DaosHandle,
-        evt_que: Option<DaosHandle>,
-    ) -> Self {
+    fn new(id: DaosObjectId, hdl: DaosHandle, evt_que: Option<DaosHandle>) -> Self {
         DaosObject {
             oid: id,
             handle: Some(hdl),
@@ -171,6 +170,7 @@ impl DaosKeyList {
 pub trait DaosObjSyncOps {
     fn create(
         cont: &DaosContainer,
+        oid_allocator: Arc<DaosSyncOidAllocator>,
         otype: daos_otype_t,
         cid: daos_oclass_id_t,
         hints: daos_oclass_hints_t,
@@ -178,6 +178,14 @@ pub trait DaosObjSyncOps {
     ) -> Result<Box<DaosObject>>;
     fn open(cont: &DaosContainer, oid: DaosObjectId, read_only: bool) -> Result<Box<DaosObject>>;
     fn punch(&self, txn: &DaosTxn) -> Result<()>;
+    fn fetch(
+        &self,
+        txn: &DaosTxn,
+        flags: u64,
+        dkey: Vec<u8>,
+        akey: Vec<u8>,
+        max_size: u32,
+    ) -> Result<Vec<u8>>;
     fn update(
         &self,
         txn: &DaosTxn,
@@ -191,6 +199,7 @@ pub trait DaosObjSyncOps {
 pub trait DaosObjAsyncOps {
     fn create_async(
         cont: &DaosContainer,
+        oid_allocator: Arc<DaosAsyncOidAllocator>,
         otype: daos_otype_t,
         cid: daos_oclass_id_t,
         hints: daos_oclass_hints_t,
@@ -228,6 +237,7 @@ pub trait DaosObjAsyncOps {
 impl DaosObjSyncOps for DaosObject {
     fn create(
         cont: &DaosContainer,
+        oid_allocator: Arc<DaosSyncOidAllocator>,
         otype: daos_otype_t,
         cid: daos_oclass_id_t,
         hints: daos_oclass_hints_t,
@@ -237,7 +247,7 @@ impl DaosObjSyncOps for DaosObject {
         let eq = cont.get_event_queue();
         let eqh = eq.map(|eq| eq.get_handle().unwrap());
 
-        let mut oid = DaosObjectId { lo: 0, hi: 0 };
+        let mut oid = oid_allocator.allocate()?;
         let ret =
             unsafe { daos_obj_generate_oid2(cont_hdl.unwrap(), &mut oid, otype, cid, hints, args) };
 
@@ -258,21 +268,115 @@ impl DaosObjSyncOps for DaosObject {
 
         if ret != 0 {
             return Err(Error::new(ErrorKind::Other, "can't open object"));
+        } else {
+            Ok(Box::new(DaosObject::new(oid, obj_hdl, eqh)))
         }
-
-        Ok(Box::new(DaosObject::new(oid, obj_hdl, eqh)))
     }
 
-    fn open(
-        _cont: &DaosContainer,
-        _oid: DaosObjectId,
-        _read_only: bool,
-    ) -> Result<Box<DaosObject>> {
-        Err(Error::new(ErrorKind::Other, "Not implemented"))
+    fn open(cont: &DaosContainer, oid: DaosObjectId, read_only: bool) -> Result<Box<DaosObject>> {
+        let cont_hdl = cont.get_handle();
+        let eq = cont.get_event_queue();
+        let eqh = eq.map(|eq| eq.get_handle().unwrap());
+
+        let mut obj_hdl = DaosHandle { cookie: 0u64 };
+        let ret = unsafe {
+            daos_obj_open(
+                cont_hdl.unwrap(),
+                oid,
+                if read_only { DAOS_OO_RO } else { DAOS_OO_RW },
+                &mut obj_hdl,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if ret != 0 {
+            Err(Error::new(
+                ErrorKind::Other,
+                format!("can't open object, ret={}", ret),
+            ))
+        } else {
+            Ok(Box::new(DaosObject::new(oid, obj_hdl, eqh)))
+        }
     }
 
     fn punch(&self, _txn: &DaosTxn) -> Result<()> {
         Err(Error::new(ErrorKind::Other, "Not implemented"))
+    }
+
+    fn fetch(
+        &self,
+        txn: &DaosTxn,
+        flags: u64,
+        dkey: Vec<u8>,
+        akey: Vec<u8>,
+        max_size: u32,
+    ) -> Result<Vec<u8>> {
+        let obj_hdl = self.get_handle();
+        if obj_hdl.is_none() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "fetch uninitialized object",
+            ));
+        }
+
+        let txn_hdl = txn.get_handle().unwrap_or(DAOS_TXN_NONE);
+        let mut dkey = dkey;
+        let mut akey = akey;
+
+        let mut dkey_wrapper = daos_key_t {
+            iov_buf: dkey.as_mut_ptr() as *mut std::os::raw::c_void,
+            iov_buf_len: dkey.len(),
+            iov_len: dkey.len(),
+        };
+
+        let mut iod = daos_iod_t {
+            iod_name: daos_key_t {
+                iov_buf: akey.as_mut_ptr() as *mut std::os::raw::c_void,
+                iov_buf_len: akey.len(),
+                iov_len: akey.len(),
+            },
+            iod_type: daos_iod_type_t_DAOS_IOD_SINGLE,
+            iod_size: DAOS_REC_ANY as u64,
+            iod_flags: 0,
+            iod_nr: 1,
+            iod_recxs: std::ptr::null_mut(),
+        };
+
+        let mut buf = Vec::with_capacity(max_size as usize);
+        buf.resize(max_size as usize, 0u8);
+
+        let mut sg_iov = d_iov_t {
+            iov_buf: buf.as_mut_ptr() as *mut std::os::raw::c_void,
+            iov_buf_len: buf.len(),
+            iov_len: buf.len(),
+        };
+
+        let mut sgl = d_sg_list_t {
+            sg_nr: 1,
+            sg_nr_out: 0,
+            sg_iovs: &mut sg_iov,
+        };
+
+        let ret = unsafe {
+            daos_obj_fetch(
+                obj_hdl.unwrap(),
+                txn_hdl,
+                flags,
+                &mut dkey_wrapper,
+                1,
+                &mut iod,
+                &mut sgl,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+
+        if ret != 0 {
+            return Err(Error::new(ErrorKind::Other, "Failed to fetch object"));
+        }
+
+        buf.resize(iod.iod_size as usize, 0xffu8);
+        Ok(buf)
     }
 
     fn update(
@@ -348,6 +452,7 @@ impl DaosObjSyncOps for DaosObject {
 impl DaosObjAsyncOps for DaosObject {
     fn create_async(
         cont: &DaosContainer,
+        oid_allocator: Arc<DaosAsyncOidAllocator>,
         otype: daos_otype_t,
         cid: daos_oclass_id_t,
         hints: daos_oclass_hints_t,
@@ -368,7 +473,7 @@ impl DaosObjAsyncOps for DaosObject {
                 return Err(Error::new(ErrorKind::InvalidData, "event queue is nil"));
             }
 
-            let mut oid = DaosObjectId { lo: 0, hi: 0 };
+            let mut oid = oid_allocator.allocate().await?;
             let ret = unsafe {
                 daos_obj_generate_oid2(cont_hdl.unwrap(), &mut oid, otype, cid, hints, args)
             };
@@ -580,7 +685,10 @@ impl DaosObjAsyncOps for DaosObject {
             match rx.await {
                 Ok(ret) => {
                     if ret != 0 {
-                        Err(Error::new(ErrorKind::Other, "async fetch operation fail"))
+                        Err(Error::new(
+                            ErrorKind::Other,
+                            format!("async fetch operation fail, ret={}", ret),
+                        ))
                     } else {
                         buf.resize(iod.iod_size as usize, 0xffu8);
                         Ok(buf)
@@ -775,15 +883,18 @@ mod tests {
         let mut pool = DaosPool::new(TEST_POOL_NAME);
         pool.connect().expect("Failed to connect to pool");
 
-        let mut cont = DaosContainer::new(TEST_CONT_NAME);
+        let mut cont = Box::new(DaosContainer::new(TEST_CONT_NAME));
         cont.connect(&pool).expect("Failed to connect to container");
+
+        let cont: Arc<DaosContainer> = Arc::from(cont);
+        let allocator = Arc::from(DaosSyncOidAllocator::new(cont.clone()).unwrap());
 
         let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
         let cid: daos_oclass_id_t = OC_UNKNOWN;
         let hints: daos_oclass_hints_t = 0;
         let args = 0;
 
-        let result = DaosObject::create(&cont, otype, cid, hints, args);
+        let result = DaosObject::create(cont.as_ref(), allocator, otype, cid, hints, args);
 
         assert!(result.is_ok());
         let _obj_box = result.unwrap();
@@ -795,27 +906,40 @@ mod tests {
         let mut pool = DaosPool::new(TEST_POOL_NAME);
         pool.connect().expect("Failed to connect to pool");
 
-        let mut cont = DaosContainer::new(TEST_CONT_NAME);
+        let mut cont = Box::new(DaosContainer::new(TEST_CONT_NAME));
         cont.connect(&pool).expect("Failed to connect to container");
+
+        let cont: Arc<DaosContainer> = Arc::from(cont);
+        let allocator = Arc::from(DaosSyncOidAllocator::new(cont.clone()).unwrap());
 
         let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
         let cid: daos_oclass_id_t = OC_UNKNOWN;
         let hints: daos_oclass_hints_t = 0;
         let args = 0;
 
-        let result = DaosObject::create(&cont, otype, cid, hints, args);
+        let result = DaosObject::create(cont.as_ref(), allocator, otype, cid, hints, args);
 
         assert!(result.is_ok());
         let obj_box = result.unwrap();
 
         let txn = DaosTxn::txn_none();
-        let flags = 0;
         let dkey = vec![0u8, 1u8, 2u8, 3u8];
         let akey = vec![0u8];
-        let data = vec![1u8; 256];
-        let result = obj_box.update(&txn, flags, dkey, akey, data);
+        let data = "something".as_bytes().to_vec();
+        let result = obj_box.update(
+            &txn,
+            DAOS_COND_DKEY_INSERT as u64,
+            dkey.clone(),
+            akey.clone(),
+            data,
+        );
         assert!(result.is_ok());
         // Assert update operation is successful
+
+        let res = obj_box.fetch(&txn, DAOS_COND_DKEY_FETCH as u64, dkey, akey, 16);
+        assert!(res.is_ok());
+        let read = res.unwrap();
+        assert_eq!(String::from_utf8(read).unwrap(), "something");
     }
 
     #[tokio::test]
@@ -823,15 +947,19 @@ mod tests {
         let mut pool = DaosPool::new(TEST_POOL_NAME);
         pool.connect().expect("Failed to connect to pool");
 
-        let mut cont = DaosContainer::new(TEST_CONT_NAME);
+        let mut cont = Box::new(DaosContainer::new(TEST_CONT_NAME));
         cont.connect(&pool).expect("Failed to connect to container");
+
+        let cont: Arc<DaosContainer> = Arc::from(cont);
+        let allocator = Arc::from(DaosAsyncOidAllocator::new(cont.clone()).unwrap());
 
         let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
         let cid: daos_oclass_id_t = OC_UNKNOWN;
         let hints: daos_oclass_hints_t = 0;
         let args = 0;
 
-        let result = DaosObject::create_async(&cont, otype, cid, hints, args).await;
+        let result =
+            DaosObject::create_async(cont.as_ref(), allocator, otype, cid, hints, args).await;
 
         assert!(result.is_ok());
         let _obj_box = result.unwrap();
@@ -843,15 +971,19 @@ mod tests {
         let mut pool = DaosPool::new(TEST_POOL_NAME);
         pool.connect().expect("Failed to connect to pool");
 
-        let mut cont = DaosContainer::new(TEST_CONT_NAME);
+        let mut cont = Box::new(DaosContainer::new(TEST_CONT_NAME));
         cont.connect(&pool).expect("Failed to connect to container");
+
+        let cont: Arc<DaosContainer> = Arc::from(cont);
+        let allocator = Arc::from(DaosAsyncOidAllocator::new(cont.clone()).unwrap());
 
         let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
         let cid: daos_oclass_id_t = OC_UNKNOWN;
         let hints: daos_oclass_hints_t = 0;
         let args = 0;
 
-        let result = DaosObject::create_async(&cont, otype, cid, hints, args).await;
+        let result =
+            DaosObject::create_async(cont.as_ref(), allocator, otype, cid, hints, args).await;
         assert!(result.is_ok());
         let obj_box = result.unwrap();
 
@@ -868,15 +1000,19 @@ mod tests {
         let mut pool = DaosPool::new(TEST_POOL_NAME);
         pool.connect().expect("Failed to connect to pool");
 
-        let mut cont = DaosContainer::new(TEST_CONT_NAME);
+        let mut cont = Box::new(DaosContainer::new(TEST_CONT_NAME));
         cont.connect(&pool).expect("Failed to connect to container");
+
+        let cont: Arc<DaosContainer> = Arc::from(cont);
+        let allocator = Arc::from(DaosAsyncOidAllocator::new(cont.clone()).unwrap());
 
         let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
         let cid: daos_oclass_id_t = OC_UNKNOWN;
         let hints: daos_oclass_hints_t = 0;
         let args = 0;
 
-        let result = DaosObject::create_async(&cont, otype, cid, hints, args).await;
+        let result =
+            DaosObject::create_async(cont.as_ref(), allocator, otype, cid, hints, args).await;
         assert!(result.is_ok());
         let obj_box = result.unwrap();
 
@@ -891,15 +1027,19 @@ mod tests {
         let mut pool = DaosPool::new(TEST_POOL_NAME);
         pool.connect().expect("Failed to connect to pool");
 
-        let mut cont = DaosContainer::new(TEST_CONT_NAME);
+        let mut cont = Box::new(DaosContainer::new(TEST_CONT_NAME));
         cont.connect(&pool).expect("Failed to connect to container");
+
+        let cont: Arc<DaosContainer> = Arc::from(cont);
+        let allocator = Arc::from(DaosAsyncOidAllocator::new(cont.clone()).unwrap());
 
         let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
         let cid: daos_oclass_id_t = OC_UNKNOWN;
         let hints: daos_oclass_hints_t = 0;
         let args = 0;
 
-        let result = DaosObject::create_async(&cont, otype, cid, hints, args).await;
+        let result =
+            DaosObject::create_async(cont.as_ref(), allocator, otype, cid, hints, args).await;
         assert!(result.is_ok());
         let obj_box = result.unwrap();
 
@@ -919,26 +1059,44 @@ mod tests {
         let mut pool = DaosPool::new(TEST_POOL_NAME);
         pool.connect().expect("Failed to connect to pool");
 
-        let mut cont = DaosContainer::new(TEST_CONT_NAME);
+        let mut cont = Box::new(DaosContainer::new(TEST_CONT_NAME));
         cont.connect(&pool).expect("Failed to connect to container");
+
+        let cont: Arc<DaosContainer> = Arc::from(cont);
+        let allocator = Arc::from(DaosAsyncOidAllocator::new(cont.clone()).unwrap());
 
         let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
         let cid: daos_oclass_id_t = OC_UNKNOWN;
         let hints: daos_oclass_hints_t = 0;
         let args = 0;
 
-        let result = DaosObject::create_async(&cont, otype, cid, hints, args).await;
+        let result =
+            DaosObject::create_async(cont.as_ref(), allocator, otype, cid, hints, args).await;
         assert!(result.is_ok());
         let obj_box = result.unwrap();
 
         let txn = DaosTxn::txn_none();
-        let flags = 0;
-        let dkey = vec![0u8, 1u8, 2u8, 3u8];
+        let dkey = "async_update".as_bytes().to_vec();
         let akey = vec![0u8];
-        let data = vec![1u8; 256];
-        let result = obj_box.update_async(&txn, flags, dkey, akey, data).await;
+        let data = "some_something".as_bytes().to_vec();
+        let result = obj_box
+            .update_async(
+                &txn,
+                DAOS_COND_DKEY_INSERT as u64,
+                dkey.clone(),
+                akey.clone(),
+                data,
+            )
+            .await;
         assert!(result.is_ok());
+
+        let res = obj_box
+            .fetch_async(&txn, DAOS_COND_DKEY_FETCH as u64, dkey, akey, 32)
+            .await;
         // Assert update operation is successful
+        assert!(res.is_ok());
+        let read = res.unwrap();
+        assert_eq!(String::from_utf8(read).unwrap(), "some_something");
     }
 
     #[tokio::test]
@@ -946,15 +1104,19 @@ mod tests {
         let mut pool = DaosPool::new(TEST_POOL_NAME);
         pool.connect().expect("Failed to connect to pool");
 
-        let mut cont = DaosContainer::new(TEST_CONT_NAME);
+        let mut cont = Box::new(DaosContainer::new(TEST_CONT_NAME));
         cont.connect(&pool).expect("Failed to connect to container");
+
+        let cont: Arc<DaosContainer> = Arc::from(cont);
+        let allocator = Arc::from(DaosAsyncOidAllocator::new(cont.clone()).unwrap());
 
         let otype = daos_otype_t_DAOS_OT_MULTI_HASHED;
         let cid: daos_oclass_id_t = OC_UNKNOWN;
         let hints: daos_oclass_hints_t = 0;
         let args = 0;
 
-        let result = DaosObject::create_async(&cont, otype, cid, hints, args).await;
+        let result =
+            DaosObject::create_async(cont.as_ref(), allocator, otype, cid, hints, args).await;
         assert!(result.is_ok());
         let obj_box = result.unwrap();
 

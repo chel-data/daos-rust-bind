@@ -22,6 +22,7 @@ pub mod daos_pool;
 pub mod daos_cont;
 pub mod daos_obj;
 pub mod daos_txn;
+pub mod daos_oid_allocator;
 
 pub fn add(left: usize, right: usize) -> usize {
     left + right

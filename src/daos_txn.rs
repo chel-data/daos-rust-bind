@@ -22,6 +22,7 @@ use crate::bindings::{
 use crate::daos_pool::DaosHandle;
 use crate::daos_cont::DaosContainer;
 use std::future::Future;
+use std::ptr;
 use std::{
     io::{Error, ErrorKind, Result},
     option::Option,
@@ -260,5 +261,73 @@ impl DaosTxnAsyncOps for DaosTxn {
                 )),
             }
         }
+    }
+}
+
+impl DaosTxnSyncOps for DaosTxn {
+    fn open(cont: &DaosContainer, flags: u64) -> Result<Box<DaosTxn>> {
+        let cont_hdl = cont.get_handle();
+        let eq = cont.get_event_queue();
+        let eqh = eq.map(|e| e.get_handle().unwrap());
+        if cont_hdl.is_none() {
+            return Err(Error::new(ErrorKind::InvalidInput, "empty container handle"));
+        }
+
+        let mut tx_hdl = DaosHandle { cookie: 0u64 };
+        let res = unsafe {
+            daos_tx_open(
+                cont_hdl.unwrap(),
+                &mut tx_hdl,
+                flags,
+                ptr::null_mut(),
+            )
+        };
+        if res != 0 {
+            return Err(Error::new(ErrorKind::Other, "fail to open DAOS transaction"));
+        }
+
+        Ok(Box::new(DaosTxn {
+            handle: Some(tx_hdl),
+            event_que: eqh,
+        }))
+    }
+
+    fn commit(&self) -> Result<()> {
+        if self.handle.is_none() {
+            return Err(Error::new(ErrorKind::InvalidData, "commit empty txn"));
+        }
+
+        let res = unsafe { daos_tx_commit(self.handle.unwrap(), ptr::null_mut()) };
+        if res != 0 {
+            return Err(Error::new(ErrorKind::Other, "Failed to commit DAOS transaction"));
+        }
+
+        Ok(())
+    }
+
+    fn abort(&self) -> Result<()> {
+        if self.handle.is_none() {
+            return Err(Error::new(ErrorKind::InvalidData, "abort empty txn"));
+        }
+
+        let res = unsafe { daos_tx_abort(self.handle.unwrap(), ptr::null_mut()) };
+        if res != 0 {
+            return Err(Error::new(ErrorKind::Other, "Failed to abort DAOS transaction"));
+        }
+
+        Ok(())
+    }
+
+    fn close(&self) -> Result<()> {
+        if self.handle.is_none() {
+            return Ok(());
+        }
+
+        let res = unsafe { daos_tx_close(self.handle.unwrap(), ptr::null_mut()) };
+        if res != 0 {
+            return Err(Error::new(ErrorKind::Other, "Failed to close DAOS transaction"));
+        }
+
+        Ok(())
     }
 }

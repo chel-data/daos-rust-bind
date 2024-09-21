@@ -37,6 +37,7 @@ impl DaosProperty {
     fn new() -> Result<Self> {
         let prop = unsafe { daos_prop_alloc(1) };
         if !prop.is_null() {
+            unsafe { (*(*prop).dpp_entries).dpe_type = daos_cont_props_DAOS_PROP_CO_ROOTS; }
             Ok(DaosProperty {
                 raw_prop: Some(prop),
             })
@@ -248,10 +249,32 @@ impl DaosContainerAsyncOps for DaosContainer {
     }
 }
 
+impl DaosContainerSyncOps for DaosContainer {
+    fn query_prop(&self) -> Result<DaosProperty> {
+        let prop = DaosProperty::new()?;
+        let ret = unsafe {
+            daos_cont_query(
+                self.handle.clone().unwrap(),
+                ptr::null_mut(),
+                prop.raw_prop.clone().unwrap(),
+                ptr::null_mut(),
+            )
+        };
+        if ret != 0 {
+            return Err(Error::new(
+                ErrorKind::Other,
+                "Failed to query DAOS container",
+            ));
+        }
+        Ok(prop)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::daos_pool::DaosPool;
+    use tokio;
     const TEST_POOL_NAME: &str = "pool1";
     const TEST_CONT_NAME: &str = "cont1";
 
@@ -289,5 +312,33 @@ mod tests {
         let result = container.disconnect();
         assert_eq!(result.is_ok(), true);
         assert_eq!(container.handle.is_some(), false);
+    }
+
+    #[test]
+    fn test_query_cont_prop() {
+        let mut pool = DaosPool::new(TEST_POOL_NAME);
+        let result = pool.connect();
+        assert_eq!(result.is_ok(), true);
+
+        let mut container = DaosContainer::new(TEST_CONT_NAME);
+        let result = container.connect(&pool);
+        assert_eq!(result.is_ok(), true);
+
+        let prop = container.query_prop();
+        assert_eq!(prop.is_ok(), true);
+    }
+
+    #[tokio::test]
+    async fn test_async_query_cont_prop() {
+        let mut pool = DaosPool::new(TEST_POOL_NAME);
+        let result = pool.connect();
+        assert_eq!(result.is_ok(), true);
+
+        let mut container = DaosContainer::new(TEST_CONT_NAME);
+        let result = container.connect(&pool);
+        assert_eq!(result.is_ok(), true);
+
+        let prop = container.query_prop_async().await;
+        assert_eq!(prop.is_ok(), true);
     }
 }

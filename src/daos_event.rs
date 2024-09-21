@@ -28,7 +28,7 @@ use tokio::sync::oneshot;
 
 #[derive(Debug)]
 pub struct CallbackArg {
-    magic: u32,
+    _magic: u32,
     tx: Option<oneshot::Sender<i32>>,
 }
 
@@ -44,7 +44,6 @@ unsafe extern "C" fn event_callback(
 ) -> i32 {
     let raw_arg = arg1 as *mut CallbackArg;
     let call_arg = Box::from_raw(raw_arg);
-    println!("event_callback is called, magic={:#x}", call_arg.magic);
     match call_arg.tx {
         Some(tx) => {
             if let Err(_) = tx.send(arg3) {
@@ -81,7 +80,7 @@ impl DaosEvent {
     pub fn register_callback(&mut self) -> Result<oneshot::Receiver<i32>> {
         let (tx, rx) = oneshot::channel::<i32>();
         let call_arg = Box::new(CallbackArg {
-            magic: 0x1caffe1d,
+            _magic: 0x1caffe1d,
             tx: Some(tx),
         });
 
