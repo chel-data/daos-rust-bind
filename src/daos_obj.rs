@@ -35,6 +35,7 @@ use std::io::{Error, ErrorKind, Result};
 use std::ptr;
 use std::sync::Arc;
 use std::vec::Vec;
+use std::fmt;
 
 const MAX_KEY_DESCS: u32 = 128;
 const KEY_BUF_SIZE: usize = 1024;
@@ -44,7 +45,7 @@ pub const DAOS_OC_UNKNOWN: daos_oclass_id_t = crate::bindings::OC_UNKNOWN;
 pub const DAOS_OC_HINTS_NONE: daos_oclass_hints_t = 0;
 pub const DAOS_COND_DKEY_INSERT: u32 = crate::bindings::DAOS_COND_DKEY_INSERT;
 pub const DAOS_COND_DKEY_UPDATE: u32 = crate::bindings::DAOS_COND_DKEY_UPDATE;
-pub const DAOS_COND_DKEY_FETCH: u32 = crate::bindings::DAOS_COND_AKEY_FETCH;
+pub const DAOS_COND_DKEY_FETCH: u32 = crate::bindings::DAOS_COND_DKEY_FETCH;
 
 impl Hash for DaosObjectId {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -63,6 +64,12 @@ impl PartialEq for DaosObjectId {
 }
 
 impl Eq for DaosObjectId {}
+
+impl fmt::Display for DaosObjectId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "({}, {})", self.lo, self.hi)
+    }
+}
 
 #[derive(Debug)]
 pub struct DaosObject {
@@ -134,7 +141,7 @@ impl DaosKeyList {
                 da_sub_anchors: 0,
                 da_buf: [0; DAOS_ANCHOR_BUF_MAX as usize],
             }),
-            ndesc: Box::new(MAX_KEY_DESCS),
+            ndesc: Box::new(0),
             key_descs: vec![
                 daos_key_desc_t {
                     kd_key_len: 0,
@@ -146,8 +153,12 @@ impl DaosKeyList {
         })
     }
 
-    pub fn prepare_next_query(&mut self) {
+    fn prepare_next_query(&mut self) {
         *(self.ndesc) = MAX_KEY_DESCS;
+    }
+
+    pub fn get_key_num(&self) -> u32 {
+        *self.ndesc
     }
 
     pub fn reach_end(&self) -> bool {
@@ -555,7 +566,7 @@ impl DaosObjAsyncOps for DaosObject {
             match rx.await {
                 Ok(ret) => {
                     if ret != 0 {
-                        Err(Error::new(ErrorKind::Other, "async open object fail"))
+                        Err(Error::new(ErrorKind::Other, format!("async open object fail, ret: {}", ret)))
                     } else {
                         Ok(Box::new(DaosObject::new(oid, *obj_hdl, eqh)))
                     }
@@ -810,7 +821,11 @@ impl DaosObjAsyncOps for DaosObject {
                 ));
             }
 
-            let mut key_lst = key_lst;
+            let mut key_lst: Box<DaosKeyList> = key_lst;
+            if key_lst.reach_end() {
+                *key_lst.ndesc = 0;
+                return Ok(key_lst);
+            }
 
             let mut event = DaosEvent::new(eq.unwrap())?;
             let rx = event.register_callback()?;
