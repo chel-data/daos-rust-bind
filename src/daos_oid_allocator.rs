@@ -114,7 +114,7 @@ impl DaosAsyncOidAllocator {
             txn.close_async().await?;
 
             let initial = OID_BATCH_CURSOR_START + OID_BATCH_SIZE;
-            let data = initial.to_le_bytes().to_vec();
+            let data = initial.to_le_bytes();
 
             let res = self
                 .meta_obj
@@ -123,7 +123,7 @@ impl DaosAsyncOidAllocator {
                     DAOS_COND_DKEY_INSERT as u64,
                     dkey.clone(),
                     akey.clone(),
-                    data,
+                    &data,
                 )
                 .await;
             if res.is_ok() {
@@ -154,13 +154,14 @@ impl DaosAsyncOidAllocator {
             (txn, u128::from_le_bytes(res.unwrap().try_into().unwrap()))
         };
 
+        let bytes = &((range_start + OID_BATCH_SIZE).to_le_bytes());
         let res = self.meta_obj
             .update_async(
                 txn.as_ref(),
                 DAOS_COND_DKEY_UPDATE as u64,
                 dkey.clone(),
                 akey.clone(),
-                (range_start + OID_BATCH_SIZE).to_le_bytes().to_vec(),
+                bytes,
             )
             .await;
         if res.is_err() {
@@ -238,7 +239,7 @@ impl DaosSyncOidAllocator {
 
         let query_again = if res.is_err() {
             let initial = OID_BATCH_CURSOR_START + OID_BATCH_SIZE;
-            let data = initial.to_le_bytes().to_vec();
+            let data = initial.to_le_bytes();
 
             let res = self
                 .meta_obj
@@ -247,7 +248,7 @@ impl DaosSyncOidAllocator {
                     DAOS_COND_DKEY_INSERT as u64,
                     dkey.clone(),
                     akey.clone(),
-                    data,
+                    &data,
                 );
             if res.is_err() {
                 true
@@ -278,13 +279,14 @@ impl DaosSyncOidAllocator {
             (txn, u128::from_le_bytes(res.unwrap().try_into().unwrap()))
         };
 
+        let bytes = &((range_start + OID_BATCH_SIZE).to_le_bytes());
         self.meta_obj
             .update(
                 txn.as_ref(),
                 DAOS_COND_DKEY_UPDATE as u64,
                 dkey.clone(),
                 akey.clone(),
-                (range_start + OID_BATCH_SIZE).to_le_bytes().to_vec(),
+                bytes,
             )?;
 
         txn.commit()?;

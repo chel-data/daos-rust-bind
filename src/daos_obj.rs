@@ -28,6 +28,7 @@ use crate::daos_oid_allocator::{DaosAsyncOidAllocator, DaosSyncOidAllocator};
 use crate::daos_pool::{DaosHandle, DaosObjectId};
 use crate::daos_txn::DaosTxn;
 use std::cmp::{Eq, PartialEq};
+use std::fmt;
 use std::future::Future;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -35,7 +36,6 @@ use std::io::{Error, ErrorKind, Result};
 use std::ptr;
 use std::sync::Arc;
 use std::vec::Vec;
-use std::fmt;
 
 const MAX_KEY_DESCS: u32 = 128;
 const KEY_BUF_SIZE: usize = 1024;
@@ -91,8 +91,8 @@ impl DaosObject {
         self.handle.clone()
     }
 
-    pub fn get_event_queue(&self) -> &Option<DaosHandle> {
-        &self.event_que
+    pub fn get_event_queue(&self) -> Option<DaosHandle> {
+        self.event_que.clone()
     }
 
     fn close(&mut self) -> Result<()> {
@@ -203,7 +203,7 @@ pub trait DaosObjSyncOps {
         flags: u64,
         dkey: Vec<u8>,
         akey: Vec<u8>,
-        data: Vec<u8>,
+        data: &[u8],
     ) -> Result<()>;
 }
 
@@ -230,14 +230,14 @@ pub trait DaosObjAsyncOps {
         akey: Vec<u8>,
         max_size: u32,
     ) -> impl Future<Output = Result<Vec<u8>>> + Send + 'static;
-    fn update_async(
+    async fn update_async(
         &self,
         txn: &DaosTxn,
         flags: u64,
         dkey: Vec<u8>,
         akey: Vec<u8>,
-        data: Vec<u8>,
-    ) -> impl Future<Output = Result<()>> + Send + 'static;
+        data: &[u8],
+    ) -> Result<()>;
     fn list_dkey_async(
         &self,
         txn: &DaosTxn,
@@ -396,7 +396,7 @@ impl DaosObjSyncOps for DaosObject {
         flags: u64,
         dkey: Vec<u8>,
         akey: Vec<u8>,
-        data: Vec<u8>,
+        data: &[u8],
     ) -> Result<()> {
         let obj_hdl = self.get_handle();
         if obj_hdl.is_none() {
@@ -566,7 +566,10 @@ impl DaosObjAsyncOps for DaosObject {
             match rx.await {
                 Ok(ret) => {
                     if ret != 0 {
-                        Err(Error::new(ErrorKind::Other, format!("async open object fail, ret: {}", ret)))
+                        Err(Error::new(
+                            ErrorKind::Other,
+                            format!("async open object fail, ret: {}", ret),
+                        ))
                     } else {
                         Ok(Box::new(DaosObject::new(oid, *obj_hdl, eqh)))
                     }
@@ -577,9 +580,9 @@ impl DaosObjAsyncOps for DaosObject {
     }
 
     fn punch_async(&self, txn: &DaosTxn) -> impl Future<Output = Result<()>> + Send + 'static {
-        let eq = self.get_event_queue().clone();
+        let eq = self.get_event_queue();
         let obj_hdl = self.get_handle();
-        let tx_hdl = txn.get_handle().clone();
+        let tx_hdl = txn.get_handle();
         async move {
             if eq.is_none() {
                 return Err(Error::new(ErrorKind::InvalidData, "event queue is nil"));
@@ -625,9 +628,9 @@ impl DaosObjAsyncOps for DaosObject {
         akey: Vec<u8>,
         max_size: u32,
     ) -> impl Future<Output = Result<Vec<u8>>> + Send + 'static {
-        let eq = self.get_event_queue().clone();
+        let eq = self.get_event_queue();
         let obj_hdl = self.get_handle();
-        let tx_hdl = txn.get_handle().clone();
+        let tx_hdl = txn.get_handle();
         async move {
             if eq.is_none() {
                 return Err(Error::new(ErrorKind::InvalidData, "event queue is nil"));
@@ -710,95 +713,94 @@ impl DaosObjAsyncOps for DaosObject {
         }
     }
 
-    fn update_async(
+    async fn update_async(
         &self,
         txn: &DaosTxn,
         flags: u64,
         dkey: Vec<u8>,
         akey: Vec<u8>,
-        data: Vec<u8>,
-    ) -> impl Future<Output = Result<()>> + Send + 'static {
-        let eq = self.get_event_queue().clone();
+        data: &[u8],
+    ) -> Result<()> {
+        let eq = self.get_event_queue();
         let obj_hdl = self.get_handle();
-        let tx_hdl = txn.get_handle().clone();
-        async move {
-            if eq.is_none() {
-                return Err(Error::new(ErrorKind::InvalidData, "event queue is nil"));
-            }
-            if obj_hdl.is_none() {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "update uninitialized object",
-                ));
-            }
+        let tx_hdl = txn.get_handle();
 
-            let mut event = DaosEvent::new(eq.unwrap())?;
-            let rx = event.register_callback()?;
+        if eq.is_none() {
+            return Err(Error::new(ErrorKind::InvalidData, "event queue is nil"));
+        }
+        if obj_hdl.is_none() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "update uninitialized object",
+            ));
+        }
 
-            let txn = match tx_hdl {
-                Some(tx) => tx,
-                None => DAOS_TXN_NONE,
-            };
+        let mut event = DaosEvent::new(eq.unwrap())?;
+        let rx = event.register_callback()?;
 
-            let mut dkey_wrapper = Box::new(daos_key_t {
-                iov_buf: dkey.as_ptr() as *mut u8 as *mut std::os::raw::c_void,
-                iov_buf_len: dkey.len(),
-                iov_len: dkey.len(),
-            });
-            let mut iod = Box::new(daos_iod_t {
-                iod_name: daos_key_t {
-                    iov_buf: akey.as_ptr() as *mut u8 as *mut std::os::raw::c_void,
-                    iov_buf_len: akey.len(),
-                    iov_len: akey.len(),
-                },
-                iod_type: daos_iod_type_t_DAOS_IOD_SINGLE,
-                iod_size: data.len() as u64,
-                iod_flags: 0,
-                iod_nr: 1,
-                iod_recxs: std::ptr::null_mut(),
-            });
-            let mut sg_iov = Box::new(d_iov_t {
-                iov_buf: data.as_ptr() as *mut u8 as *mut std::os::raw::c_void,
-                iov_buf_len: data.len(),
-                iov_len: data.len(),
-            });
-            let mut sgl = Box::new(d_sg_list_t {
-                sg_nr: 1,
-                sg_nr_out: 0,
-                sg_iovs: sg_iov.as_mut(),
-            });
-            let ret = unsafe {
-                daos_obj_update(
-                    obj_hdl.unwrap(),
-                    txn,
-                    flags,
-                    dkey_wrapper.as_mut(),
-                    1,
-                    iod.as_mut(),
-                    sgl.as_mut(),
-                    event.as_mut(),
-                )
-            };
-            if ret != 0 {
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    format!("can't update object, ret={}", ret),
-                ));
-            }
+        let txn = match tx_hdl {
+            Some(tx) => tx,
+            None => DAOS_TXN_NONE,
+        };
 
-            match rx.await {
-                Ok(ret) => {
-                    if ret != 0 {
-                        Err(Error::new(
-                            ErrorKind::Other,
-                            format!("async update operation fail, ret={}", ret),
-                        ))
-                    } else {
-                        Ok(())
-                    }
+        let mut dkey_wrapper = Box::new(daos_key_t {
+            iov_buf: dkey.as_ptr() as *mut u8 as *mut std::os::raw::c_void,
+            iov_buf_len: dkey.len(),
+            iov_len: dkey.len(),
+        });
+        let mut iod = Box::new(daos_iod_t {
+            iod_name: daos_key_t {
+                iov_buf: akey.as_ptr() as *mut u8 as *mut std::os::raw::c_void,
+                iov_buf_len: akey.len(),
+                iov_len: akey.len(),
+            },
+            iod_type: daos_iod_type_t_DAOS_IOD_SINGLE,
+            iod_size: data.len() as u64,
+            iod_flags: 0,
+            iod_nr: 1,
+            iod_recxs: std::ptr::null_mut(),
+        });
+        let mut sg_iov = Box::new(d_iov_t {
+            iov_buf: data.as_ptr() as *mut u8 as *mut std::os::raw::c_void,
+            iov_buf_len: data.len(),
+            iov_len: data.len(),
+        });
+        let mut sgl = Box::new(d_sg_list_t {
+            sg_nr: 1,
+            sg_nr_out: 0,
+            sg_iovs: sg_iov.as_mut(),
+        });
+        let ret = unsafe {
+            daos_obj_update(
+                obj_hdl.unwrap(),
+                txn,
+                flags,
+                dkey_wrapper.as_mut(),
+                1,
+                iod.as_mut(),
+                sgl.as_mut(),
+                event.as_mut(),
+            )
+        };
+        if ret != 0 {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!("can't update object, ret={}", ret),
+            ));
+        }
+
+        match rx.await {
+            Ok(ret) => {
+                if ret != 0 {
+                    Err(Error::new(
+                        ErrorKind::Other,
+                        format!("async update operation fail, ret={}", ret),
+                    ))
+                } else {
+                    Ok(())
                 }
-                Err(_) => Err(Error::new(ErrorKind::ConnectionReset, "rx is closed early")),
             }
+            Err(_) => Err(Error::new(ErrorKind::ConnectionReset, "rx is closed early")),
         }
     }
 
@@ -807,9 +809,9 @@ impl DaosObjAsyncOps for DaosObject {
         txn: &DaosTxn,
         key_lst: Box<DaosKeyList>,
     ) -> impl Future<Output = Result<Box<DaosKeyList>>> + Send + 'static {
-        let eq = self.get_event_queue().clone();
+        let eq = self.get_event_queue();
         let obj_hdl = self.get_handle();
-        let tx_hdl = txn.get_handle().clone();
+        let tx_hdl = txn.get_handle();
         async move {
             if eq.is_none() {
                 return Err(Error::new(ErrorKind::InvalidData, "event queue is nil"));
@@ -940,7 +942,7 @@ mod tests {
         let txn = DaosTxn::txn_none();
         let dkey = vec![0u8, 1u8, 2u8, 3u8];
         let akey = vec![0u8];
-        let data = "something".as_bytes().to_vec();
+        let data = "something".as_bytes();
         let result = obj_box.update(
             &txn,
             DAOS_COND_DKEY_INSERT as u64,
@@ -1093,7 +1095,7 @@ mod tests {
         let txn = DaosTxn::txn_none();
         let dkey = "async_update".as_bytes().to_vec();
         let akey = vec![0u8];
-        let data = "some_something".as_bytes().to_vec();
+        let data = "some_something".as_bytes();
         let result = obj_box
             .update_async(
                 &txn,
@@ -1140,7 +1142,7 @@ mod tests {
         let akey = vec![0u8];
         let data = vec![1u8; 256];
         let res = obj_box
-            .update_async(&txn, DAOS_COND_DKEY_INSERT as u64, dkey, akey, data)
+            .update_async(&txn, DAOS_COND_DKEY_INSERT as u64, dkey, akey, data.as_slice())
             .await;
         assert!(res.is_ok());
 
@@ -1148,7 +1150,7 @@ mod tests {
         let akey = vec![0u8];
         let data = vec![2u8; 256];
         let res = obj_box
-            .update_async(&txn, DAOS_COND_DKEY_INSERT as u64, dkey, akey, data)
+            .update_async(&txn, DAOS_COND_DKEY_INSERT as u64, dkey, akey, data.as_slice())
             .await;
         assert!(res.is_ok());
 
