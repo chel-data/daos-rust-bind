@@ -98,6 +98,7 @@ impl DaosAsyncOidAllocator {
 
         let dkey = OID_BATCH_CURSOR_KEY.as_bytes().to_vec();
         let akey = vec![0u8];
+        let mut data = vec![0u8; 32];
         let res = self
             .meta_obj
             .fetch_async(
@@ -105,7 +106,7 @@ impl DaosAsyncOidAllocator {
                 DAOS_COND_DKEY_FETCH as u64,
                 dkey.clone(),
                 akey.clone(),
-                32,
+                data.as_mut_slice(),
             )
             .await;
 
@@ -114,7 +115,7 @@ impl DaosAsyncOidAllocator {
             txn.close_async().await?;
 
             let initial = OID_BATCH_CURSOR_START + OID_BATCH_SIZE;
-            let data = initial.to_le_bytes();
+            let init_val = initial.to_le_bytes();
 
             let res = self
                 .meta_obj
@@ -123,7 +124,7 @@ impl DaosAsyncOidAllocator {
                     DAOS_COND_DKEY_INSERT as u64,
                     dkey.clone(),
                     akey.clone(),
-                    &data,
+                    &init_val,
                 )
                 .await;
             if res.is_ok() {
@@ -141,17 +142,19 @@ impl DaosAsyncOidAllocator {
                     DAOS_COND_DKEY_FETCH as u64,
                     dkey.clone(),
                     akey.clone(),
-                    32,
+                    data.as_mut_slice(),
                 )
                 .await;
             if res.is_err() {
                 txn.abort_async().await?;
                 txn.close_async().await?;
-                return Err(Error::new(ErrorKind::Other, "Failed to re-query OID batch"));
+                return Err(res.unwrap_err());
             }
-            (txn, u128::from_le_bytes(res.unwrap().try_into().unwrap()))
+            data.resize(res.unwrap(), 0);
+            (txn, u128::from_le_bytes(data.try_into().unwrap()))
         } else {
-            (txn, u128::from_le_bytes(res.unwrap().try_into().unwrap()))
+            data.resize(res.unwrap(), 0);
+            (txn, u128::from_le_bytes(data.try_into().unwrap()))
         };
 
         let bytes = &((range_start + OID_BATCH_SIZE).to_le_bytes());
@@ -167,7 +170,7 @@ impl DaosAsyncOidAllocator {
         if res.is_err() {
             txn.abort_async().await?;
             txn.close_async().await?;
-            return Err(Error::new(ErrorKind::Other, "Failed to re-query OID batch"));
+            return Err(res.unwrap_err());
         }
 
         txn.commit_async().await?;

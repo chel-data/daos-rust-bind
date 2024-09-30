@@ -17,10 +17,10 @@
 
 use crate::bindings::{
     d_iov_t, d_sg_list_t, daos_anchor_is_eof, daos_anchor_t, daos_event_t, daos_iod_t,
-    daos_iod_type_t_DAOS_IOD_SINGLE, daos_key_desc_t, daos_key_t, daos_obj_close, daos_obj_fetch,
-    daos_obj_generate_oid2, daos_obj_list_dkey, daos_obj_open, daos_obj_punch, daos_obj_update,
-    daos_oclass_hints_t, daos_oclass_id_t, daos_otype_t, DAOS_ANCHOR_BUF_MAX, DAOS_OO_RO,
-    DAOS_OO_RW, DAOS_REC_ANY, DAOS_TXN_NONE,
+    daos_iod_type_t_DAOS_IOD_ARRAY, daos_iod_type_t_DAOS_IOD_SINGLE, daos_key_desc_t, daos_key_t,
+    daos_obj_close, daos_obj_fetch, daos_obj_generate_oid2, daos_obj_list_dkey, daos_obj_open,
+    daos_obj_punch, daos_obj_update, daos_oclass_hints_t, daos_oclass_id_t, daos_otype_t,
+    daos_recx_t, DAOS_ANCHOR_BUF_MAX, DAOS_OO_RO, DAOS_OO_RW, DAOS_REC_ANY, DAOS_TXN_NONE,
 };
 use crate::daos_cont::DaosContainer;
 use crate::daos_event::*;
@@ -222,20 +222,38 @@ pub trait DaosObjAsyncOps {
         read_only: bool,
     ) -> impl Future<Output = Result<Box<DaosObject>>> + Send + 'static;
     fn punch_async(&self, txn: &DaosTxn) -> impl Future<Output = Result<()>> + Send + 'static;
-    fn fetch_async(
+    async fn fetch_async(
         &self,
         txn: &DaosTxn,
         flags: u64,
         dkey: Vec<u8>,
         akey: Vec<u8>,
-        max_size: u32,
-    ) -> impl Future<Output = Result<Vec<u8>>> + Send + 'static;
+        out_buf: &mut [u8],
+    ) -> Result<usize>;
     async fn update_async(
         &self,
         txn: &DaosTxn,
         flags: u64,
         dkey: Vec<u8>,
         akey: Vec<u8>,
+        data: &[u8],
+    ) -> Result<()>;
+    async fn fetch_recx_async(
+        &self,
+        txn: &DaosTxn,
+        flags: u64,
+        dkey: Vec<u8>,
+        akey: Vec<u8>,
+        offset: u64,
+        out_buf: &mut [u8],
+    ) -> Result<usize>;
+    async fn update_recx_async(
+        &self,
+        txn: &DaosTxn,
+        flags: u64,
+        dkey: Vec<u8>,
+        akey: Vec<u8>,
+        offset: u64,
         data: &[u8],
     ) -> Result<()>;
     fn list_dkey_async(
@@ -620,96 +638,93 @@ impl DaosObjAsyncOps for DaosObject {
         }
     }
 
-    fn fetch_async(
+    async fn fetch_async(
         &self,
         txn: &DaosTxn,
         flags: u64,
         dkey: Vec<u8>,
         akey: Vec<u8>,
-        max_size: u32,
-    ) -> impl Future<Output = Result<Vec<u8>>> + Send + 'static {
+        out_buf: &mut [u8],
+    ) -> Result<usize> {
         let eq = self.get_event_queue();
         let obj_hdl = self.get_handle();
         let tx_hdl = txn.get_handle();
-        async move {
-            if eq.is_none() {
-                return Err(Error::new(ErrorKind::InvalidData, "event queue is nil"));
-            }
-            if obj_hdl.is_none() {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "fetch uninitialized object",
-                ));
-            }
 
-            let mut event = DaosEvent::new(eq.unwrap())?;
-            let rx = event.register_callback()?;
+        if eq.is_none() {
+            return Err(Error::new(ErrorKind::InvalidData, "event queue is nil"));
+        }
+        if obj_hdl.is_none() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "fetch uninitialized object",
+            ));
+        }
 
-            let txn = match tx_hdl {
-                Some(tx) => tx,
-                None => DAOS_TXN_NONE,
-            };
+        let mut event = DaosEvent::new(eq.unwrap())?;
+        let rx = event.register_callback()?;
 
-            let mut dkey_wrapper = Box::new(daos_key_t {
-                iov_buf: dkey.as_ptr() as *mut u8 as *mut std::os::raw::c_void,
-                iov_buf_len: dkey.len(),
-                iov_len: dkey.len(),
-            });
-            let mut iod = Box::new(daos_iod_t {
-                iod_name: daos_key_t {
-                    iov_buf: akey.as_ptr() as *mut u8 as *mut std::os::raw::c_void,
-                    iov_buf_len: akey.len(),
-                    iov_len: akey.len(),
-                },
-                iod_type: daos_iod_type_t_DAOS_IOD_SINGLE,
-                iod_size: DAOS_REC_ANY as u64,
-                iod_flags: 0,
-                iod_nr: 1,
-                iod_recxs: std::ptr::null_mut(),
-            });
-            let mut buf = Vec::with_capacity(max_size as usize);
-            buf.resize(max_size as usize, 0u8);
-            let mut sg_iov = Box::new(d_iov_t {
-                iov_buf: buf.as_mut_ptr() as *mut std::os::raw::c_void,
-                iov_buf_len: buf.len(),
-                iov_len: buf.len(),
-            });
-            let mut sgl = Box::new(d_sg_list_t {
-                sg_nr: 1,
-                sg_nr_out: 0,
-                sg_iovs: sg_iov.as_mut(),
-            });
-            let ret = unsafe {
-                daos_obj_fetch(
-                    obj_hdl.unwrap(),
-                    txn,
-                    flags,
-                    dkey_wrapper.as_mut(),
-                    1,
-                    iod.as_mut(),
-                    sgl.as_mut(),
-                    ptr::null_mut(),
-                    event.as_mut(),
-                )
-            };
-            if ret != 0 {
-                return Err(Error::new(ErrorKind::Other, "can't fetch object"));
-            }
+        let txn = match tx_hdl {
+            Some(tx) => tx,
+            None => DAOS_TXN_NONE,
+        };
 
-            match rx.await {
-                Ok(ret) => {
-                    if ret != 0 {
-                        Err(Error::new(
-                            ErrorKind::Other,
-                            format!("async fetch operation fail, ret={}", ret),
-                        ))
-                    } else {
-                        buf.resize(iod.iod_size as usize, 0xffu8);
-                        Ok(buf)
-                    }
+        let mut dkey_wrapper = Box::new(daos_key_t {
+            iov_buf: dkey.as_ptr() as *mut u8 as *mut std::os::raw::c_void,
+            iov_buf_len: dkey.len(),
+            iov_len: dkey.len(),
+        });
+        let mut iod = Box::new(daos_iod_t {
+            iod_name: daos_key_t {
+                iov_buf: akey.as_ptr() as *mut u8 as *mut std::os::raw::c_void,
+                iov_buf_len: akey.len(),
+                iov_len: akey.len(),
+            },
+            iod_type: daos_iod_type_t_DAOS_IOD_SINGLE,
+            iod_size: DAOS_REC_ANY as u64,
+            iod_flags: 0,
+            iod_nr: 1,
+            iod_recxs: std::ptr::null_mut(),
+        });
+
+        let mut sg_iov = Box::new(d_iov_t {
+            iov_buf: out_buf.as_mut_ptr() as *mut std::os::raw::c_void,
+            iov_buf_len: out_buf.len(),
+            iov_len: out_buf.len(),
+        });
+        let mut sgl = Box::new(d_sg_list_t {
+            sg_nr: 1,
+            sg_nr_out: 0,
+            sg_iovs: sg_iov.as_mut(),
+        });
+        let ret = unsafe {
+            daos_obj_fetch(
+                obj_hdl.unwrap(),
+                txn,
+                flags,
+                dkey_wrapper.as_mut(),
+                1,
+                iod.as_mut(),
+                sgl.as_mut(),
+                ptr::null_mut(),
+                event.as_mut(),
+            )
+        };
+        if ret != 0 {
+            return Err(Error::new(ErrorKind::Other, "can't fetch object"));
+        }
+
+        match rx.await {
+            Ok(ret) => {
+                if ret != 0 {
+                    Err(Error::new(
+                        ErrorKind::Other,
+                        format!("async fetch operation fail, ret={}", ret),
+                    ))
+                } else {
+                    Ok(iod.iod_size as usize)
                 }
-                Err(_) => Err(Error::new(ErrorKind::ConnectionReset, "rx is closed early")),
             }
+            Err(_) => Err(Error::new(ErrorKind::ConnectionReset, "rx is closed early")),
         }
     }
 
@@ -795,6 +810,196 @@ impl DaosObjAsyncOps for DaosObject {
                     Err(Error::new(
                         ErrorKind::Other,
                         format!("async update operation fail, ret={}", ret),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Err(_) => Err(Error::new(ErrorKind::ConnectionReset, "rx is closed early")),
+        }
+    }
+
+    async fn fetch_recx_async(
+        &self,
+        txn: &DaosTxn,
+        flags: u64,
+        dkey: Vec<u8>,
+        akey: Vec<u8>,
+        offset: u64,
+        data: &mut [u8],
+    ) -> Result<usize> {
+        let eq = self.get_event_queue();
+        let obj_hdl = self.get_handle();
+        let tx_hdl = txn.get_handle();
+
+        if eq.is_none() {
+            return Err(Error::new(ErrorKind::InvalidData, "event queue is nil"));
+        }
+        if obj_hdl.is_none() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "fetch uninitialized object",
+            ));
+        }
+
+        let mut event = DaosEvent::new(eq.unwrap())?;
+        let rx = event.register_callback()?;
+
+        let txn = match tx_hdl {
+            Some(tx) => tx,
+            None => DAOS_TXN_NONE,
+        };
+
+        let mut dkey_wrapper = daos_key_t {
+            iov_buf: dkey.as_ptr() as *mut u8 as *mut std::os::raw::c_void,
+            iov_buf_len: dkey.len(),
+            iov_len: dkey.len(),
+        };
+        let mut recx = daos_recx_t {
+            rx_idx: offset,
+            rx_nr: data.len() as u64,
+        };
+        let mut iod = daos_iod_t {
+            iod_name: daos_key_t {
+                iov_buf: akey.as_ptr() as *mut u8 as *mut std::os::raw::c_void,
+                iov_buf_len: akey.len(),
+                iov_len: akey.len(),
+            },
+            iod_type: daos_iod_type_t_DAOS_IOD_ARRAY,
+            iod_size: DAOS_REC_ANY as u64,
+            iod_flags: 0,
+            iod_nr: 1,
+            iod_recxs: &mut recx,
+        };
+        let mut sg_iov = d_iov_t {
+            iov_buf: data.as_mut_ptr() as *mut std::os::raw::c_void,
+            iov_buf_len: data.len(),
+            iov_len: data.len(),
+        };
+        let mut sgl = d_sg_list_t {
+            sg_nr: 1,
+            sg_nr_out: 0,
+            sg_iovs: &mut sg_iov,
+        };
+        let ret = unsafe {
+            daos_obj_fetch(
+                obj_hdl.unwrap(),
+                txn,
+                flags,
+                &mut dkey_wrapper,
+                1,
+                &mut iod,
+                &mut sgl,
+                std::ptr::null_mut(),
+                event.as_mut(),
+            )
+        };
+        if ret != 0 {
+            return Err(Error::new(ErrorKind::Other, "can't fetch recx"));
+        }
+
+        match rx.await {
+            Ok(ret) => {
+                if ret != 0 {
+                    Err(Error::new(
+                        ErrorKind::Other,
+                        format!("async fetch recx fail, ret={}", ret),
+                    ))
+                } else {
+                    Ok(data.len())
+                }
+            }
+            Err(_) => Err(Error::new(ErrorKind::ConnectionReset, "rx is closed early")),
+        }
+    }
+
+    async fn update_recx_async(
+        &self,
+        txn: &DaosTxn,
+        flags: u64,
+        dkey: Vec<u8>,
+        akey: Vec<u8>,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        let eq = self.get_event_queue();
+        let obj_hdl = self.get_handle();
+        let tx_hdl = txn.get_handle();
+
+        if eq.is_none() {
+            return Err(Error::new(ErrorKind::InvalidData, "event queue is nil"));
+        }
+        if obj_hdl.is_none() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "update uninitialized object",
+            ));
+        }
+
+        let mut event = DaosEvent::new(eq.unwrap())?;
+        let rx = event.register_callback()?;
+
+        let txn = match tx_hdl {
+            Some(tx) => tx,
+            None => DAOS_TXN_NONE,
+        };
+
+        let mut dkey_wrapper = daos_key_t {
+            iov_buf: dkey.as_ptr() as *mut u8 as *mut std::os::raw::c_void,
+            iov_buf_len: dkey.len(),
+            iov_len: dkey.len(),
+        };
+        let mut recx = daos_recx_t {
+            rx_idx: offset,
+            rx_nr: data.len() as u64,
+        };
+        let mut iod = daos_iod_t {
+            iod_name: daos_key_t {
+                iov_buf: akey.as_ptr() as *mut u8 as *mut std::os::raw::c_void,
+                iov_buf_len: akey.len(),
+                iov_len: akey.len(),
+            },
+            iod_type: daos_iod_type_t_DAOS_IOD_ARRAY,
+            iod_size: 1u64,
+            iod_flags: 0,
+            iod_nr: 1,
+            iod_recxs: &mut recx,
+        };
+        let mut sg_iov = d_iov_t {
+            iov_buf: data.as_ptr() as *mut u8 as *mut std::os::raw::c_void,
+            iov_buf_len: data.len(),
+            iov_len: data.len(),
+        };
+        let mut sgl = d_sg_list_t {
+            sg_nr: 1,
+            sg_nr_out: 0,
+            sg_iovs: &mut sg_iov,
+        };
+        let ret = unsafe {
+            daos_obj_update(
+                obj_hdl.unwrap(),
+                txn,
+                flags,
+                &mut dkey_wrapper,
+                1,
+                &mut iod,
+                &mut sgl,
+                event.as_mut(),
+            )
+        };
+        if ret != 0 {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!("can't update recx, ret={}", ret),
+            ));
+        }
+
+        match rx.await {
+            Ok(ret) => {
+                if ret != 0 {
+                    Err(Error::new(
+                        ErrorKind::Other,
+                        format!("async update recx operation fail, ret={}", ret),
                     ))
                 } else {
                     Ok(())
@@ -1064,10 +1269,11 @@ mod tests {
         let flags = 0;
         let dkey = vec![0u8, 1u8, 2u8, 3u8];
         let akey = vec![0u8];
-        let max = 1024;
-        let result = obj_box.fetch_async(&txn, flags, dkey, akey, max).await;
+        let mut buf = vec![0u8; 1024];
+        let result = obj_box
+            .fetch_async(&txn, flags, dkey, akey, buf.as_mut_slice())
+            .await;
         assert!(result.is_ok());
-        let _data = result.unwrap();
         // Assert fetched data is correct
     }
 
@@ -1107,13 +1313,21 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
+        let mut buf = vec![0u8, 32];
         let res = obj_box
-            .fetch_async(&txn, DAOS_COND_DKEY_FETCH as u64, dkey, akey, 32)
+            .fetch_async(
+                &txn,
+                DAOS_COND_DKEY_FETCH as u64,
+                dkey,
+                akey,
+                buf.as_mut_slice(),
+            )
             .await;
         // Assert update operation is successful
         assert!(res.is_ok());
-        let read = res.unwrap();
-        assert_eq!(String::from_utf8(read).unwrap(), "some_something");
+        let out_size = res.unwrap();
+        buf.resize(out_size, 0);
+        assert_eq!(String::from_utf8(buf).unwrap(), "some_something");
     }
 
     #[tokio::test]
@@ -1142,7 +1356,13 @@ mod tests {
         let akey = vec![0u8];
         let data = vec![1u8; 256];
         let res = obj_box
-            .update_async(&txn, DAOS_COND_DKEY_INSERT as u64, dkey, akey, data.as_slice())
+            .update_async(
+                &txn,
+                DAOS_COND_DKEY_INSERT as u64,
+                dkey,
+                akey,
+                data.as_slice(),
+            )
             .await;
         assert!(res.is_ok());
 
@@ -1150,7 +1370,13 @@ mod tests {
         let akey = vec![0u8];
         let data = vec![2u8; 256];
         let res = obj_box
-            .update_async(&txn, DAOS_COND_DKEY_INSERT as u64, dkey, akey, data.as_slice())
+            .update_async(
+                &txn,
+                DAOS_COND_DKEY_INSERT as u64,
+                dkey,
+                akey,
+                data.as_slice(),
+            )
             .await;
         assert!(res.is_ok());
 
